@@ -208,9 +208,37 @@ resource "null_resource" "deploy_contracts" {
   }
 
   provisioner "remote-exec" {
-  inline = [
-    "chmod +x /tmp/deploy_contracts.sh",
-    "bash /tmp/deploy_contracts.sh"
-  ]
+    inline = [
+      "chmod +x /tmp/deploy_contracts.sh",
+      "bash /tmp/deploy_contracts.sh"
+    ]
+  }
 }
+
+# ============================================================================
+# ETAPA 3: Execução dos Testes com Caliper
+# ============================================================================
+
+resource "null_resource" "run_caliper_tests" {
+  depends_on = [null_resource.deploy_contracts]
+
+  provisioner "local-exec" {
+    command = "scp -o StrictHostKeyChecking=no -i ${var.private_key_path} ${path.module}/scripts/run_caliper_tests.sh ubuntu@${aws_eip.besu_ec2.public_ip}:/tmp/run_caliper_tests.sh"
+  }
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.private_key_path)
+    host        = aws_eip.besu_ec2.public_ip
+    agent       = false
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/run_caliper_tests.sh",
+      "bash /tmp/run_caliper_tests.sh"
+    ]
+  }
+
 }
