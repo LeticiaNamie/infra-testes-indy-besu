@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================================
-# Etapa 3 — Passos 1 a 9: Setup do Caliper e configuração do networkconfig.json
+# Etapa 3 — Passos 1 a 11: Setup do Caliper, configuração e execução dos testes
 # Executado como ubuntu via SSH (remote-exec).
 # ============================================================================
 
@@ -26,7 +26,22 @@ CALIPER_ROOT="$CLONE_ROOT/evaluation-contracts-indy-besu"
 DEPLOY_ARTIFACTS_DIR="/home/ubuntu/deploy-artifacts"
 BESU_ROOT="/home/ubuntu/besu-production-docker"
 
-log "======== Etapa 3 — Início (passos 1-9) ========"
+log "======== Etapa 3 — Início (passos 1-11) ========"
+
+# ============================================================================
+# Garantir permissão de acesso ao Docker socket
+# O Caliper monitora containers via /var/run/docker.sock. Se ubuntu não estiver
+# no grupo docker, o monitoramento falha com EACCES. O usermod não tem efeito
+# na sessão atual, então o script se re-executa via sg para que o grupo docker
+# esteja ativo sem precisar de novo login.
+# ============================================================================
+if ! id -nG "$USER" | grep -qw docker; then
+  log "Adicionando $USER ao grupo docker e re-executando com permissões corretas"
+  sudo usermod -aG docker "$USER"
+  check "Adição de $USER ao grupo docker"
+  exec sg docker "$0"
+fi
+log "OK: $USER pertence ao grupo docker"
 
 # ============================================================================
 # Passo 1 — Verificar artefatos da Etapa 2
@@ -260,4 +275,32 @@ else
   log "AVISO: Porta 8645 não encontrada no networkconfig.json — verifique se o campo 'url' ws existe no arquivo"
 fi
 
-log "======== Etapa 3 — Passos 1-9 concluídos com sucesso ========"
+# ============================================================================
+# Passo 10 — Executar os testes com Caliper
+# ============================================================================
+log "[Passo 10] Executando testes com Caliper (run_test_local.py)"
+
+cd "$CALIPER_ROOT"
+python3 run_test_local.py 2>&1 | tee -a "$LOG_FILE"
+check "Execução dos testes com Caliper"
+
+# ============================================================================
+# Passo 11 — Extrair resultados para CSV
+# ============================================================================
+log "[Passo 11] Extraindo resultados para CSV"
+
+log "Instalando dependências Python para extração de resultados"
+pip3 install --quiet pandas beautifulsoup4 lxml
+check "Instalação de pandas e beautifulsoup4"
+
+cd "$CALIPER_ROOT/src"
+python3 extract_report_to_csv.py 2>&1 | tee -a "$LOG_FILE"
+check "extract_report_to_csv.py"
+
+python3 extract_resource_to_csv.py 2>&1 | tee -a "$LOG_FILE"
+check "extract_resource_to_csv.py"
+
+log "Arquivos CSV gerados:"
+find "$CALIPER_ROOT" -name "*.csv" | tee -a "$LOG_FILE"
+
+log "======== Etapa 3 — Concluída com sucesso (passos 1-11) ========"

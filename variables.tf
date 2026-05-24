@@ -6,7 +6,7 @@ variable "aws_region" {
 
 variable "instance_type" {
   type        = string
-  default     = "t3.large"
+  default     = "m6i.2xlarge"
   description = "Tipo da instância EC2."
 }
 
