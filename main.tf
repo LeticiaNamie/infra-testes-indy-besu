@@ -31,6 +31,8 @@ data "aws_ami" "ubuntu" {
   }
 }
 
+data "aws_caller_identity" "current" {}
+
 data "aws_vpc" "default" {
   default = true
 }
@@ -119,6 +121,59 @@ resource "aws_key_pair" "besu" {
   public_key = file("~/.ssh/besu-key.pub")
 }
 
+# ============================================================================
+# ETAPA 3: S3 e IAM para upload dos resultados do Caliper
+# ============================================================================
+
+resource "aws_s3_bucket" "caliper_results" {
+  bucket = "${var.caliper_results_bucket}-${data.aws_caller_identity.current.account_id}"
+
+  tags = {
+    Name    = var.caliper_results_bucket
+    Project = var.project_name
+  }
+}
+
+resource "aws_s3_bucket_ownership_controls" "caliper_results" {
+  bucket = aws_s3_bucket.caliper_results.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_iam_role" "besu_s3_access" {
+  name = "${var.project_name}-s3-access-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "besu_s3_write" {
+  name = "${var.project_name}-s3-write-policy"
+  role = aws_iam_role.besu_s3_access.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:PutObject", "s3:PutObjectAcl"]
+      Resource = "${aws_s3_bucket.caliper_results.arn}/*"
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "besu_s3_profile" {
+  name = "${var.project_name}-s3-instance-profile"
+  role = aws_iam_role.besu_s3_access.name
+}
+
 resource "aws_instance" "besu" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
@@ -126,6 +181,7 @@ resource "aws_instance" "besu" {
   vpc_security_group_ids      = [aws_security_group.besu.id]
   key_name                    = aws_key_pair.besu.key_name
   associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.besu_s3_profile.name
 
   user_data = templatefile("${path.module}/scripts/user_data.sh", {
     project_name = var.project_name
@@ -220,7 +276,7 @@ resource "null_resource" "deploy_contracts" {
 # ============================================================================
 
 resource "null_resource" "run_caliper_tests" {
-  depends_on = [null_resource.deploy_contracts]
+  depends_on = [null_resource.deploy_contracts, aws_iam_instance_profile.besu_s3_profile]
 
   provisioner "local-exec" {
     command = "scp -o StrictHostKeyChecking=no -i ${var.private_key_path} ${path.module}/scripts/run_caliper_tests.sh ubuntu@${aws_eip.besu_ec2.public_ip}:/tmp/run_caliper_tests.sh"
@@ -240,5 +296,4 @@ resource "null_resource" "run_caliper_tests" {
       "bash /tmp/run_caliper_tests.sh"
     ]
   }
-
 }

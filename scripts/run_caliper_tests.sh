@@ -84,7 +84,7 @@ fi
 log "OK: Rede Besu ativa — bloco atual: $BLOCK"
 
 # ============================================================================
-# Passo 3 — Garantir Python 3 instalado
+# Passo 3 — Garantir Python 3 e dependências instalados
 # ============================================================================
 log "[Passo 3] Verificando instalação do Python 3"
 
@@ -94,6 +94,24 @@ if ! command -v python3 &> /dev/null; then
   check "Instalação do Python 3"
 else
   log "OK: Python 3 já instalado: $(python3 --version)"
+  if ! command -v pip3 &> /dev/null; then
+    log "pip3 não encontrado. Instalando python3-pip..."
+    sudo apt-get update -y && sudo apt-get install -y python3-pip
+    check "Instalação do python3-pip"
+  fi
+fi
+
+log "[Passo 3] Instalando dependências Python para extração de resultados"
+pip3 install --quiet pandas beautifulsoup4 lxml
+check "Instalação de pandas e beautifulsoup4"
+
+log "[Passo 3] Verificando instalação do AWS CLI"
+if ! command -v aws &> /dev/null; then
+  log "AWS CLI não encontrado. Instalando..."
+  sudo apt-get update -y -qq && sudo apt-get install -y -qq awscli
+  check "Instalação do AWS CLI"
+else
+  log "OK: AWS CLI já instalado: $(aws --version 2>&1)"
 fi
 
 # ============================================================================
@@ -289,10 +307,6 @@ check "Execução dos testes com Caliper"
 # ============================================================================
 log "[Passo 11] Extraindo resultados para CSV"
 
-log "Instalando dependências Python para extração de resultados"
-pip3 install --quiet pandas beautifulsoup4 lxml
-check "Instalação de pandas e beautifulsoup4"
-
 cd "$CALIPER_ROOT/src"
 python3 extract_report_to_csv.py 2>&1 | tee -a "$LOG_FILE"
 check "extract_report_to_csv.py"
@@ -303,4 +317,55 @@ check "extract_resource_to_csv.py"
 log "Arquivos CSV gerados:"
 find "$CALIPER_ROOT" -name "*.csv" | tee -a "$LOG_FILE"
 
-log "======== Etapa 3 — Concluída com sucesso (passos 1-11) ========"
+# ============================================================================
+# Passo 12 — Upload dos CSVs para S3
+# ============================================================================
+log "[Passo 12] Fazendo upload dos CSVs para S3"
+
+AWS_REGION=$(curl -s --max-time 5 http://169.254.169.254/latest/meta-data/placement/region || true)
+if [ -z "$AWS_REGION" ]; then
+  log "AVISO: Não foi possível obter a região via metadata — usando us-east-1 como fallback"
+  AWS_REGION="us-east-1"
+fi
+log "Região AWS: $AWS_REGION"
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
+if [ -z "$ACCOUNT_ID" ]; then
+  log "ERRO: Não foi possível obter o Account ID via aws sts get-caller-identity"
+  exit 1
+fi
+S3_BUCKET="tests-with-caliper-results-${ACCOUNT_ID}"
+TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
+S3_PREFIX="s3://${S3_BUCKET}/${TIMESTAMP}"
+
+log "Destino S3: $S3_PREFIX"
+
+CSV_COUNT=0
+
+for DIR in "$CALIPER_ROOT/src/"*_resource_metrics_by_tps; do
+  if [ -d "$DIR" ]; then
+    DIRNAME=$(basename "$DIR")
+    aws s3 cp "$DIR/" "${S3_PREFIX}/resource_metrics/${DIRNAME}/" \
+      --recursive --exclude "*" --include "*.csv" \
+      --region "$AWS_REGION" 2>&1 | tee -a "$LOG_FILE"
+    CSV_COUNT=$((CSV_COUNT + $(find "$DIR" -name "*.csv" | wc -l)))
+  fi
+done
+
+for DIR in "$CALIPER_ROOT/src/reports/"*; do
+  if [ -d "$DIR" ]; then
+    DIRNAME=$(basename "$DIR")
+    aws s3 cp "$DIR/" "${S3_PREFIX}/reports/${DIRNAME}/" \
+      --recursive --exclude "*" --include "*.csv" \
+      --region "$AWS_REGION" 2>&1 | tee -a "$LOG_FILE"
+    CSV_COUNT=$((CSV_COUNT + $(find "$DIR" -name "*.csv" | wc -l)))
+  fi
+done
+
+if [ "$CSV_COUNT" -eq 0 ]; then
+  log "AVISO: Nenhum CSV encontrado para upload"
+else
+  log "OK: $CSV_COUNT arquivo(s) CSV enviado(s) para $S3_PREFIX"
+fi
+
+log "======== Etapa 3 — Concluída com sucesso (passos 1-12) ========"

@@ -32,3 +32,9 @@ variable "private_key_path" {
   default     = "~/.ssh/id_rsa"
   description = "Caminho local para a chave privada SSH usada para acessar a instância EC2."
 }
+
+variable "caliper_results_bucket" {
+  type        = string
+  default     = "tests-with-caliper-results"
+  description = "Nome do bucket S3 onde os CSVs de resultados do Caliper serão armazenados."
+}

@@ -19,6 +19,20 @@ output "rpc_url" {
 }
 
 # ============================================================================
+# Etapa 3: S3
+# ============================================================================
+
+output "s3_bucket_name" {
+  description = "Nome do bucket S3 criado para os resultados do Caliper."
+  value       = aws_s3_bucket.caliper_results.bucket
+}
+
+output "s3_check_command" {
+  description = "Comando para verificar se os arquivos foram enviados ao S3."
+  value       = "aws s3 ls s3://${aws_s3_bucket.caliper_results.bucket}/ --recursive"
+}
+
+# ============================================================================
 # Etapa 2: Deploy dos Contratos
 # ============================================================================
 
