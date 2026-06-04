@@ -1,0 +1,5 @@
+allowed_ssh_cidr = "189.62.45.78/32"
+private_key_path = "~/.ssh/besu-key"
+public_key_path  = "~/.ssh/besu-key.pub"
+instance_type    = "t3.medium"
+project_name     = "besu-distributed"
