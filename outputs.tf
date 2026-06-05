@@ -39,6 +39,20 @@ output "s3_keys_bucket" {
   value       = aws_s3_bucket.besu_keys.bucket
 }
 
+output "deploy_artifacts_commands" {
+  description = "Comandos para verificar os artefatos do deploy no Node-1 e no S3."
+  value       = <<-EOT
+    # Verificar network-info.json (chainId, rpcUrl):
+    ssh -i ${var.private_key_path} ubuntu@${aws_eip.node1.public_ip} 'cat /home/ubuntu/deploy-artifacts/network-info.json'
+
+    # Verificar endereços dos contratos (journal Ignition):
+    ssh -i ${var.private_key_path} ubuntu@${aws_eip.node1.public_ip} 'ls /home/ubuntu/deploy-artifacts/deployments/'
+
+    # Verificar artefatos no S3:
+    aws s3 ls s3://${aws_s3_bucket.besu_keys.bucket}/artifacts/ --recursive
+  EOT
+}
+
 output "validation_commands" {
   description = "Comandos para validar a rede após o apply."
   value       = <<-EOT

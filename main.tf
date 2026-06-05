@@ -361,27 +361,52 @@ resource "null_resource" "start_node2" {
   }
 }
 
-# 4. Aguarda a rede Besu estar operacional (polling RPC no Node-1)
+# 4. Aguarda a rede Besu estar operacional: RPC respondendo E pelo menos 1 peer conectado
 resource "null_resource" "wait_network_ready" {
   depends_on = [null_resource.start_node1, null_resource.start_node2]
 
   provisioner "local-exec" {
     command = <<-EOT
-      echo "Aguardando Besu responder na porta 8545 do Node-1..."
+      echo "Aguardando Node-1 ter peers conectados (net_peerCount >= 0x1)..."
       for i in $(seq 1 40); do
         sleep 15
         RESULT=$(curl -s --max-time 5 -X POST \
           --data '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
           http://${aws_eip.node1.public_ip}:8545 2>/dev/null || true)
         PEERS=$(echo "$RESULT" | grep -o '"result":"0x[^"]*"' | grep -o '0x[0-9a-f]*' || true)
-        if [ -n "$PEERS" ]; then
-          echo "Rede respondendo após $((i * 15))s — peers: $PEERS"
+        if [ -n "$PEERS" ] && [ "$PEERS" != "0x0" ]; then
+          echo "Rede com peers após $((i * 15))s — peerCount: $PEERS"
           exit 0
         fi
-        echo "Tentativa $i/40: Besu ainda não responde..."
+        echo "Tentativa $i/40: peers=$PEERS (aguardando >= 0x1)..."
       done
-      echo "Timeout aguardando a rede Besu"
+      echo "Timeout aguardando peers na rede Besu"
       exit 1
     EOT
+  }
+}
+
+# 5. Deploy dos contratos inteligentes no Node-1 (após rede com peers confirmados)
+resource "null_resource" "deploy_contracts" {
+  depends_on = [null_resource.wait_network_ready]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.private_key_path)
+    host        = aws_eip.node1.public_ip
+    agent       = false
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/scripts/deploy_contracts.sh"
+    destination = "/tmp/deploy_contracts.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/deploy_contracts.sh",
+      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_keys.bucket} AWS_REGION=${var.aws_region} bash /tmp/deploy_contracts.sh",
+    ]
   }
 }
