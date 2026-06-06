@@ -87,6 +87,13 @@ fi
 
 cd "$REPO_ROOT"
 
+# Node-1: garante que o WS escute em 0.0.0.0 (necessário para o Caliper em EC2 separada)
+# Por padrão o Besu liga o WS em 127.0.0.1 — sem esse flag a porta fica fechada externamente
+if [ "$NODE_INDEX" = "1" ] && ! grep -q "rpc-ws-host" "$COMPOSE_FILE"; then
+  sed -i '/--rpc-ws-port=8645/a\      --rpc-ws-host=0.0.0.0' "$COMPOSE_FILE"
+  log "Adicionado --rpc-ws-host=0.0.0.0 ao $COMPOSE_FILE"
+fi
+
 # Verifica que o compose file correto existe
 if [ ! -f "$COMPOSE_FILE" ]; then
   log "ERRO: $COMPOSE_FILE não encontrado em $REPO_ROOT"

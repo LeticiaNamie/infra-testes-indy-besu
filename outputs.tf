@@ -34,9 +34,9 @@ output "log_commands" {
   ]
 }
 
-output "s3_keys_bucket" {
-  description = "Bucket S3 usado para distribuição de chaves entre os nós."
-  value       = aws_s3_bucket.besu_keys.bucket
+output "s3_data_bucket" {
+  description = "Bucket S3 compartilhado: chaves, artefatos de deploy e resultados Caliper."
+  value       = aws_s3_bucket.besu_data.bucket
 }
 
 output "deploy_artifacts_commands" {
@@ -49,7 +49,7 @@ output "deploy_artifacts_commands" {
     ssh -i ${var.private_key_path} ubuntu@${aws_eip.node1.public_ip} 'ls /home/ubuntu/deploy-artifacts/deployments/'
 
     # Verificar artefatos no S3:
-    aws s3 ls s3://${aws_s3_bucket.besu_keys.bucket}/artifacts/ --recursive
+    aws s3 ls s3://${aws_s3_bucket.besu_data.bucket}/artifacts/ --recursive
   EOT
 }
 
@@ -61,5 +61,31 @@ output "validation_commands" {
 
     # Verificar peers conectados (deve retornar 0x1 com 2 nós):
     curl -s -X POST --data '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' http://${aws_eip.node1.public_ip}:8545
+  EOT
+}
+
+output "caliper_public_ip" {
+  description = "IP público da instância Caliper (muda a cada apply)."
+  value       = aws_instance.caliper.public_ip
+}
+
+output "caliper_ssh_command" {
+  description = "Comando SSH para acessar a instância Caliper."
+  value       = "ssh -i ${var.private_key_path} ubuntu@${aws_instance.caliper.public_ip}  # Caliper"
+}
+
+output "caliper_log_command" {
+  description = "Comando para acompanhar o log de execução do Caliper."
+  value       = "ssh -i ${var.private_key_path} ubuntu@${aws_instance.caliper.public_ip} 'tail -f /home/ubuntu/besu-setup.log'"
+}
+
+output "caliper_results_commands" {
+  description = "Comandos para verificar os resultados dos testes Caliper no S3 (prefixo caliper-results/)."
+  value       = <<-EOT
+    # Listar todas as execuções:
+    aws s3 ls s3://${aws_s3_bucket.besu_data.bucket}/caliper-results/ --recursive
+
+    # Baixar todos os CSVs de uma execução (substituir <timestamp>):
+    aws s3 cp s3://${aws_s3_bucket.besu_data.bucket}/caliper-results/<timestamp>/ ./caliper-results/ --recursive
   EOT
 }

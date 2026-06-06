@@ -154,14 +154,14 @@ resource "aws_key_pair" "besu" {
 # S3 — bucket para distribuição de chaves entre os nós
 # ============================================================================
 
-resource "aws_s3_bucket" "besu_keys" {
-  bucket        = "${var.project_name}-keys-${data.aws_caller_identity.current.account_id}"
+resource "aws_s3_bucket" "besu_data" {
+  bucket        = "${var.project_name}-data-${data.aws_caller_identity.current.account_id}"
   force_destroy = true
-  tags          = { Name = "${var.project_name}-keys" }
+  tags          = { Name = "${var.project_name}-data" }
 }
 
-resource "aws_s3_bucket_public_access_block" "besu_keys" {
-  bucket                  = aws_s3_bucket.besu_keys.id
+resource "aws_s3_bucket_public_access_block" "besu_data" {
+  bucket                  = aws_s3_bucket.besu_data.id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
@@ -193,8 +193,8 @@ resource "aws_iam_role_policy" "besu_node_s3" {
       Effect = "Allow"
       Action = ["s3:PutObject", "s3:GetObject", "s3:ListBucket"]
       Resource = [
-        aws_s3_bucket.besu_keys.arn,
-        "${aws_s3_bucket.besu_keys.arn}/*"
+        aws_s3_bucket.besu_data.arn,
+        "${aws_s3_bucket.besu_data.arn}/*"
       ]
     }]
   })
@@ -306,7 +306,7 @@ resource "null_resource" "generate_and_distribute_keys" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/generate_and_distribute_keys.sh",
-      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_keys.bucket} AWS_REGION=${var.aws_region} bash /tmp/generate_and_distribute_keys.sh",
+      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/generate_and_distribute_keys.sh",
     ]
   }
 }
@@ -331,7 +331,7 @@ resource "null_resource" "start_node1" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/start_besu_node.sh",
-      "NODE_INDEX=1 S3_KEYS_BUCKET=${aws_s3_bucket.besu_keys.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+      "NODE_INDEX=1 S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
     ]
   }
 }
@@ -356,7 +356,7 @@ resource "null_resource" "start_node2" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/start_besu_node.sh",
-      "NODE_INDEX=2 S3_KEYS_BUCKET=${aws_s3_bucket.besu_keys.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+      "NODE_INDEX=2 S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
     ]
   }
 }
@@ -406,7 +406,127 @@ resource "null_resource" "deploy_contracts" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/deploy_contracts.sh",
-      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_keys.bucket} AWS_REGION=${var.aws_region} bash /tmp/deploy_contracts.sh",
+      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/deploy_contracts.sh",
+    ]
+  }
+}
+
+# ============================================================================
+# Etapa 3 — Testes com Caliper em instância dedicada
+# ============================================================================
+
+# IAM role dedicada para a instância Caliper
+# Leitura e escrita no mesmo bucket besu-keys — prefixo caliper-results/ para os CSVs
+resource "aws_iam_role" "caliper" {
+  name = "${var.project_name}-caliper-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "caliper_s3" {
+  name = "${var.project_name}-caliper-s3-policy"
+  role = aws_iam_role.caliper.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
+      Resource = [
+        aws_s3_bucket.besu_data.arn,
+        "${aws_s3_bucket.besu_data.arn}/*"
+      ]
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "caliper" {
+  name = "${var.project_name}-caliper-profile"
+  role = aws_iam_role.caliper.name
+}
+
+# EC2 dedicada para o Caliper — mesma VPC, acessa Node-1 via IP privado
+resource "aws_instance" "caliper" {
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.besu.id
+  vpc_security_group_ids      = [aws_security_group.besu_nodes.id]
+  key_name                    = aws_key_pair.besu.key_name
+  associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.caliper.name
+
+  user_data = templatefile("${path.module}/scripts/node_user_data.sh", {
+    node_index = "caliper"
+    aws_region = var.aws_region
+  })
+
+  tags = {
+    Name    = "${var.project_name}-caliper"
+    Project = var.project_name
+    Role    = "caliper"
+  }
+}
+
+# 6. Aguarda SSH + user_data na instância Caliper (em paralelo com o setup do Besu)
+resource "null_resource" "wait_ssh_caliper" {
+  depends_on = [aws_instance.caliper]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes -i ${var.private_key_path}"
+      HOST="${aws_instance.caliper.public_ip}"
+
+      echo "Aguardando SSH na instância Caliper ($HOST)..."
+      for i in $(seq 1 36); do
+        if ssh $SSH_OPTS ubuntu@$HOST 'echo ok' 2>/dev/null; then
+          echo "SSH Caliper ok após $((i * 10))s"
+          break
+        fi
+        echo "Tentativa $i/36: aguardando SSH Caliper..."
+        sleep 10
+      done
+
+      echo "Aguardando user_data concluir na instância Caliper..."
+      for i in $(seq 1 36); do
+        if ssh $SSH_OPTS ubuntu@$HOST 'test -f /home/ubuntu/.node-ready' 2>/dev/null; then
+          echo "user_data Caliper concluído após $((i * 10))s"
+          exit 0
+        fi
+        echo "Tentativa $i/36: user_data ainda em execução no Caliper..."
+        sleep 10
+      done
+      echo "ERRO: timeout aguardando user_data no Caliper"
+      exit 1
+    EOT
+  }
+}
+
+# 7. Executa os testes com Caliper após deploy dos contratos E instância Caliper pronta
+resource "null_resource" "run_caliper_tests" {
+  depends_on = [null_resource.deploy_contracts, null_resource.wait_ssh_caliper]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.private_key_path)
+    host        = aws_instance.caliper.public_ip
+    agent       = false
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/scripts/run_caliper_tests.sh"
+    destination = "/tmp/run_caliper_tests.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/run_caliper_tests.sh",
+      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} NODE1_PRIVATE_IP=10.0.1.10 bash /tmp/run_caliper_tests.sh",
     ]
   }
 }
