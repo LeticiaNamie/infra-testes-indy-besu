@@ -14,6 +14,7 @@ KEY_DIR="/home/ubuntu/besu-keys"
 : "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
 : "${AWS_REGION:?AWS_REGION não definido}"
 : "${NODE1_PRIVATE_IP:?NODE1_PRIVATE_IP não definido}"
+: "${NODE2_PRIVATE_IP:?NODE2_PRIVATE_IP não definido}"
 
 NODE1_RPC="http://${NODE1_PRIVATE_IP}:8545"
 NODE1_WS="ws://${NODE1_PRIVATE_IP}:8645"
@@ -255,6 +256,65 @@ check "Validação do networkconfig.json"
 grep "$NODE1_PRIVATE_IP" "$NETWORK_CONFIG" >/dev/null || {
   log "AVISO: IP do Node-1 ($NODE1_PRIVATE_IP) não encontrado no networkconfig.json"
 }
+
+# ============================================================================
+# Passo 10.5 — Instalar e iniciar Prometheus para monitoramento dos nós Besu
+# ============================================================================
+log "Instalando Prometheus..."
+PROM_VERSION="2.48.1"
+wget -q "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
+  -O /tmp/prometheus.tar.gz 2>>"$LOG_FILE"
+tar -xzf /tmp/prometheus.tar.gz -C /tmp/
+check "Download e extração do Prometheus"
+
+cat > /tmp/prometheus.yml << PROMEOF
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: besu
+    static_configs:
+      - targets: ['${NODE1_PRIVATE_IP}:9545']
+        labels:
+          instance: node1
+      - targets: ['${NODE2_PRIVATE_IP}:9546']
+        labels:
+          instance: node2
+PROMEOF
+
+log "Iniciando Prometheus em background (porta 9090)..."
+/tmp/prometheus-${PROM_VERSION}.linux-amd64/prometheus \
+  --config.file=/tmp/prometheus.yml \
+  --storage.tsdb.path=/tmp/prometheus-data \
+  --web.listen-address=:9090 \
+  >> "$LOG_FILE" 2>&1 &
+
+# Aguarda Prometheus aceitar requisições
+for i in $(seq 1 12); do
+  if curl -s -f http://localhost:9090/-/ready >/dev/null 2>&1; then
+    log "Prometheus pronto"
+    break
+  fi
+  log "Aguardando Prometheus... ($i/12)"
+  sleep 5
+done
+curl -s -f http://localhost:9090/-/ready >/dev/null 2>&1
+check "Prometheus iniciado na porta 9090"
+
+# Aguarda pelo menos um ciclo de scrape dos dois nós
+log "Aguardando primeiro scrape dos nós Besu..."
+for i in $(seq 1 12); do
+  UP=$(curl -s "http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22besu%22%7D" \
+    | python3 -c "import sys,json; r=json.load(sys.stdin); print(sum(1 for x in r['data']['result'] if x['value'][1]=='1'))" 2>/dev/null || echo 0)
+  if [ "$UP" -eq 2 ]; then
+    log "Ambos os nós Besu respondendo ao Prometheus"
+    break
+  fi
+  log "Aguardando scrape dos nós Besu ($UP/2 up)... ($i/12)"
+  sleep 5
+done
+[ "$UP" -eq 2 ] || log "AVISO: nem todos os nós estão sendo scraped (UP=$UP). Verifique métricas após o teste."
 
 # ============================================================================
 # Passo 11 — Executar os testes com Caliper

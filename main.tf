@@ -126,7 +126,7 @@ resource "aws_security_group" "besu_nodes" {
   ingress {
     description = "Prometheus metrics"
     from_port   = 9545
-    to_port     = 9545
+    to_port     = 9546
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -526,7 +526,7 @@ resource "null_resource" "run_caliper_tests" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/run_caliper_tests.sh",
-      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} NODE1_PRIVATE_IP=10.0.1.10 bash /tmp/run_caliper_tests.sh",
+      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} NODE1_PRIVATE_IP=10.0.1.10 NODE2_PRIVATE_IP=10.0.1.11 bash /tmp/run_caliper_tests.sh",
     ]
   }
 }
