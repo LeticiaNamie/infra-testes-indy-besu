@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Roda no Node-1 via remote-exec.
-# Gera chaves para os 2 nós, constrói enode URLs com IPs fixos e sobe tudo para S3.
+# Gera chaves para os 6 nós, constrói enode URLs com IPs fixos e sobe tudo para S3.
 set -euo pipefail
 
 LOG_FILE="/home/ubuntu/besu-setup.log"
@@ -17,7 +17,7 @@ PERMISSIONED_DIR="$REPO_ROOT/Permissioned-Network"
 : "${AWS_REGION:?AWS_REGION não definido}"
 
 # IPs privados fixos — mesma subnet, alocados pelo Terraform
-declare -A NODE_IPS=([1]="10.0.1.10" [2]="10.0.1.11")
+declare -A NODE_IPS=([1]="10.0.1.10" [2]="10.0.1.11" [3]="10.0.1.12" [4]="10.0.1.13" [5]="10.0.1.14" [6]="10.0.1.15")
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -28,7 +28,7 @@ check() {
   log "OK: $1"
 }
 
-log "=== Gerando e distribuindo chaves para a rede Besu distribuída ==="
+log "=== Gerando e distribuindo chaves para a rede Besu distribuída (6 nós) ==="
 
 # Clone do repositório adaptado para distribuição
 if [ -d "$REPO_ROOT" ]; then rm -rf "$REPO_ROOT"; fi
@@ -79,9 +79,9 @@ if [ -f "$REPO_ROOT/generate-nodes-config.sh" ]; then
   check "generate-nodes-config.sh"
 else
   log "generate-nodes-config.sh não encontrado — criando estrutura manualmente"
-  # Descobre os endereços gerados e cria Node-1/Node-2
+  # Descobre os endereços gerados e cria Node-1..Node-6
   KEY_DIRS=("$REPO_ROOT/networkFiles/keys"/*)
-  for i in 1 2; do
+  for i in 1 2 3 4 5 6; do
     NODE_DIR="$PERMISSIONED_DIR/Node-$i/data"
     mkdir -p "$NODE_DIR"
     SRC_DIR="${KEY_DIRS[$((i-1))]}"
@@ -92,13 +92,13 @@ else
 fi
 
 # Valida que os diretórios e chaves existem
-for i in 1 2; do
+for i in 1 2 3 4 5 6; do
   if [ ! -f "$PERMISSIONED_DIR/Node-$i/data/key.pub" ]; then
     log "ERRO: key.pub não encontrado em Node-$i/data"
     exit 1
   fi
 done
-check "Estrutura de diretórios dos 2 nós validada"
+check "Estrutura de diretórios dos 6 nós validada"
 
 # Patch do permissions_config.toml — substitui o IP placeholder pelo IP fixo correto
 # de cada nó, identificando cada entrada pela sua pubkey.
@@ -139,10 +139,18 @@ EOF
 
 PUBKEY1=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-1/data/key.pub" | tr -d '[:space:]')
 PUBKEY2=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-2/data/key.pub" | tr -d '[:space:]')
+PUBKEY3=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-3/data/key.pub" | tr -d '[:space:]')
+PUBKEY4=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-4/data/key.pub" | tr -d '[:space:]')
+PUBKEY5=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-5/data/key.pub" | tr -d '[:space:]')
+PUBKEY6=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-6/data/key.pub" | tr -d '[:space:]')
 
 python3 /tmp/patch_permissions.py "$PERMISSIONS_TOML" \
   "$PUBKEY1" "${NODE_IPS[1]}" \
-  "$PUBKEY2" "${NODE_IPS[2]}"
+  "$PUBKEY2" "${NODE_IPS[2]}" \
+  "$PUBKEY3" "${NODE_IPS[3]}" \
+  "$PUBKEY4" "${NODE_IPS[4]}" \
+  "$PUBKEY5" "${NODE_IPS[5]}" \
+  "$PUBKEY6" "${NODE_IPS[6]}"
 check "Patch de IPs no permissions_config.toml"
 
 log "permissions_config.toml após patch:"
@@ -155,14 +163,14 @@ STATIC_NODES_JSON=$(python3 -c "
 import re, json, sys
 text = open(sys.argv[1]).read()
 items = re.findall(r'enode://[^\s\"\']+', text)
-# Filtra apenas os 2 nós gerenciados (10.0.1.10 e 10.0.1.11)
+# Filtra apenas os 6 nós gerenciados (10.0.1.10 a 10.0.1.15)
 managed = [e for e in items if '@10.0.1.' in e]
 print(json.dumps(managed, indent=2))
 " "$PERMISSIONS_TOML")
 check "Extração dos enodes para static-nodes.json"
 log "static-nodes.json: $STATIC_NODES_JSON"
 
-# ENODE_NODE1 = enode do Node-1 extraído do permissions_config.toml patchado
+# Extrai enode do Node-1 e Node-3 (ambos são bootnodes)
 ENODE_NODE1=$(python3 -c "
 import re, sys
 text = open(sys.argv[1]).read()
@@ -175,8 +183,24 @@ print(node1[0])
 check "Extração do enode do Node-1"
 log "Node-1 enode (bootnode): $ENODE_NODE1"
 
+ENODE_NODE3=$(python3 -c "
+import re, sys
+text = open(sys.argv[1]).read()
+items = re.findall(r'enode://[^\s\"\']+', text)
+node3 = [e for e in items if '@10.0.1.12:' in e]
+if not node3:
+    raise SystemExit('ERRO: enode do Node-3 (10.0.1.12) não encontrado no permissions_config.toml')
+print(node3[0])
+" "$PERMISSIONS_TOML")
+check "Extração do enode do Node-3"
+log "Node-3 enode (bootnode): $ENODE_NODE3"
+
+# String de bootnodes: Node-1 e Node-3 para os validators (Node-2, 4, 5, 6)
+BOOTNODES="${ENODE_NODE1},${ENODE_NODE3}"
+log "Bootnodes para validators: $BOOTNODES"
+
 # Distribui genesis, static-nodes e permissions para cada nó
-for i in 1 2; do
+for i in 1 2 3 4 5 6; do
   NODE_DATA="$PERMISSIONED_DIR/Node-$i/data"
   echo "$STATIC_NODES_JSON" > "$NODE_DATA/static-nodes.json"
   cp "$PERMISSIONS_TOML" "$NODE_DATA/permissions_config.toml"
@@ -184,30 +208,30 @@ for i in 1 2; do
   check "Arquivos de configuração distribuídos para Node-$i"
 done
 
-# Patch do docker-compose.validator.yaml — substitui o placeholder de --bootnodes
-# pelo enode real do Node-1 (único bootnode por enquanto)
+# Patch do docker-compose.validator.yaml — substitui --bootnodes pelos enodes
+# de ambos os bootnodes (Node-1 e Node-3)
 VALIDATOR_COMPOSE="$REPO_ROOT/docker-compose.validator.yaml"
 if [ ! -f "$VALIDATOR_COMPOSE" ]; then
   log "ERRO: $VALIDATOR_COMPOSE não encontrado"
   exit 1
 fi
 
-log "Ajustando --bootnodes em $VALIDATOR_COMPOSE com enode do Node-1..."
+log "Ajustando --bootnodes em $VALIDATOR_COMPOSE com enodes de Node-1 e Node-3..."
 cat > /tmp/adjust_bootnodes.py << 'EOF'
 import re, sys
-path, bootnode = sys.argv[1], sys.argv[2]
+path, bootnodes = sys.argv[1], sys.argv[2]
 text = open(path).read()
 pattern = re.compile(r'(--bootnodes=)(\S*)')
 matches = pattern.findall(text)
 print(f"DEBUG: ocorrências de --bootnodes encontradas: {len(matches)}", file=sys.stderr)
 if not matches:
     raise SystemExit("ERRO: --bootnodes não encontrado em docker-compose.validator.yaml")
-new = pattern.sub(lambda m: m.group(1) + bootnode, text)
+new = pattern.sub(lambda m: m.group(1) + bootnodes, text)
 open(path, 'w').write(new)
-print(f"DEBUG: bootnode inserido: {bootnode}", file=sys.stderr)
+print(f"DEBUG: bootnodes inseridos: {bootnodes}", file=sys.stderr)
 EOF
 
-python3 /tmp/adjust_bootnodes.py "$VALIDATOR_COMPOSE" "$ENODE_NODE1" 2>> "$LOG_FILE"
+python3 /tmp/adjust_bootnodes.py "$VALIDATOR_COMPOSE" "$BOOTNODES" 2>> "$LOG_FILE"
 check "Substituição do --bootnodes em docker-compose.validator.yaml"
 
 log "Verificando substituição:"
@@ -215,7 +239,7 @@ grep -i "bootnodes" "$VALIDATOR_COMPOSE" | tee -a "$LOG_FILE"
 
 # Upload para S3 — chaves por nó + arquivos compartilhados
 log "Fazendo upload das chaves e configurações para S3..."
-for i in 1 2; do
+for i in 1 2 3 4 5 6; do
   NODE_DATA="$PERMISSIONED_DIR/Node-$i/data"
   aws s3 cp "$NODE_DATA/key"     "s3://$S3_KEYS_BUCKET/node-$i/key"     --region "$AWS_REGION"
   aws s3 cp "$NODE_DATA/key.pub" "s3://$S3_KEYS_BUCKET/node-$i/key.pub" --region "$AWS_REGION"
@@ -228,14 +252,16 @@ aws s3 cp "$PERMISSIONS_TOML"                                    "s3://$S3_KEYS_
 aws s3 cp "$VALIDATOR_COMPOSE"                                   "s3://$S3_KEYS_BUCKET/shared/docker-compose.validator.yaml"   --region "$AWS_REGION"
 check "Arquivos compartilhados enviados para S3"
 
-ENODE_NODE2=$(python3 -c "
+log "=== Geração e distribuição de chaves concluída com sucesso ==="
+log "Node-1 enode (bootnode): $ENODE_NODE1"
+log "Node-3 enode (bootnode): $ENODE_NODE3"
+for i in 2 4 5 6; do
+  ENODE_NODE=$(python3 -c "
 import re, sys
 text = open(sys.argv[1]).read()
 items = re.findall(r'enode://[^\s\"\']+', text)
-node2 = [e for e in items if '@10.0.1.11:' in e]
-print(node2[0] if node2 else '(nao encontrado)')
+node = [e for e in items if '@${NODE_IPS[$i]}:' in e]
+print(node[0] if node else '(nao encontrado)')
 " "$PERMISSIONS_TOML")
-
-log "=== Geração e distribuição de chaves concluída com sucesso ==="
-log "Node-1 enode: $ENODE_NODE1"
-log "Node-2 enode: $ENODE_NODE2"
+  log "Node-$i enode: $ENODE_NODE"
+done

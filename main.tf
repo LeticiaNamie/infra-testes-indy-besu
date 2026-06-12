@@ -70,7 +70,7 @@ resource "aws_route_table_association" "besu" {
 }
 
 # ============================================================================
-# Security Group — mesmo SG para os 2 nós; P2P liberado apenas entre eles
+# Security Group — mesmo SG para os 6 nós; P2P liberado apenas entre eles
 # ============================================================================
 
 resource "aws_security_group" "besu_nodes" {
@@ -86,7 +86,7 @@ resource "aws_security_group" "besu_nodes" {
     cidr_blocks = [var.allowed_ssh_cidr]
   }
 
-  # RPC HTTP: 8545 (Node-1), 8546 (Node-2)
+  # RPC HTTP: 8545 (bootnode.yaml) e 8546 (validator.yaml) — mesmas portas em todos os EC2
   ingress {
     description = "RPC HTTP"
     from_port   = 8545
@@ -95,7 +95,7 @@ resource "aws_security_group" "besu_nodes" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # WebSocket: 8645 (Node-1), 8646 (Node-2)
+  # WebSocket: 8645 (bootnode.yaml) e 8646 (validator.yaml)
   ingress {
     description = "WebSocket"
     from_port   = 8645
@@ -206,13 +206,28 @@ resource "aws_iam_instance_profile" "besu_node" {
 }
 
 # ============================================================================
-# EC2 — 2 instâncias com IPs privados fixos
+# EC2 — 6 instâncias com IPs privados fixos
 #   index 0 → Node-1 (bootnode)  → 10.0.1.10
 #   index 1 → Node-2 (validator) → 10.0.1.11
+#   index 2 → Node-3 (bootnode)  → 10.0.1.12
+#   index 3 → Node-4 (validator) → 10.0.1.13
+#   index 4 → Node-5 (validator) → 10.0.1.14
+#   index 5 → Node-6 (validator) → 10.0.1.15
 # ============================================================================
 
+locals {
+  node_roles = [
+    "bootnode",   # Node-1
+    "validator",  # Node-2
+    "bootnode",   # Node-3
+    "validator",  # Node-4
+    "validator",  # Node-5
+    "validator",  # Node-6
+  ]
+}
+
 resource "aws_instance" "besu_node" {
-  count = 2
+  count = 6
 
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
@@ -232,7 +247,7 @@ resource "aws_instance" "besu_node" {
     Name      = "${var.project_name}-node-${count.index + 1}"
     Project   = var.project_name
     NodeIndex = tostring(count.index + 1)
-    NodeRole  = count.index == 0 ? "bootnode" : "validator"
+    NodeRole  = local.node_roles[count.index]
   }
 }
 
@@ -247,7 +262,7 @@ resource "aws_eip" "node1" {
 # null_resource: cadeia de setup distribuído
 # ============================================================================
 
-# 1. Aguarda SSH disponível nos 2 nós antes de prosseguir
+# 1. Aguarda SSH disponível nos 6 nós antes de prosseguir
 resource "null_resource" "wait_ssh_all_nodes" {
   depends_on = [aws_eip.node1, aws_instance.besu_node]
 
@@ -282,6 +297,10 @@ resource "null_resource" "wait_ssh_all_nodes" {
 
       wait_node "Node-1" "${aws_eip.node1.public_ip}"
       wait_node "Node-2" "${aws_instance.besu_node[1].public_ip}"
+      wait_node "Node-3" "${aws_instance.besu_node[2].public_ip}"
+      wait_node "Node-4" "${aws_instance.besu_node[3].public_ip}"
+      wait_node "Node-5" "${aws_instance.besu_node[4].public_ip}"
+      wait_node "Node-6" "${aws_instance.besu_node[5].public_ip}"
     EOT
   }
 }
@@ -336,9 +355,34 @@ resource "null_resource" "start_node1" {
   }
 }
 
-# 3b. Inicia Node-2 (validator) — clona repo e baixa chaves do S3
-resource "null_resource" "start_node2" {
+# 3b. Inicia Node-3 (bootnode) — paralelo com Node-1; validators só sobem após ambos os bootnodes
+resource "null_resource" "start_node3" {
   depends_on = [null_resource.generate_and_distribute_keys]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.private_key_path)
+    host        = aws_instance.besu_node[2].public_ip
+    agent       = false
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/scripts/start_besu_node.sh"
+    destination = "/tmp/start_besu_node.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/start_besu_node.sh",
+      "NODE_INDEX=3 S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+    ]
+  }
+}
+
+# 3c. Inicia Node-2 (validator) — após ambos os bootnodes estarem prontos
+resource "null_resource" "start_node2" {
+  depends_on = [null_resource.start_node1, null_resource.start_node3]
 
   connection {
     type        = "ssh"
@@ -361,26 +405,108 @@ resource "null_resource" "start_node2" {
   }
 }
 
-# 4. Aguarda a rede Besu estar operacional: RPC respondendo E pelo menos 1 peer conectado
+# 3d. Inicia Node-4 (validator) — paralelo com Node-2, após ambos os bootnodes
+resource "null_resource" "start_node4" {
+  depends_on = [null_resource.start_node1, null_resource.start_node3]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.private_key_path)
+    host        = aws_instance.besu_node[3].public_ip
+    agent       = false
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/scripts/start_besu_node.sh"
+    destination = "/tmp/start_besu_node.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/start_besu_node.sh",
+      "NODE_INDEX=4 S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+    ]
+  }
+}
+
+# 3e. Inicia Node-5 (validator) — paralelo com Node-2, após ambos os bootnodes
+resource "null_resource" "start_node5" {
+  depends_on = [null_resource.start_node1, null_resource.start_node3]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.private_key_path)
+    host        = aws_instance.besu_node[4].public_ip
+    agent       = false
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/scripts/start_besu_node.sh"
+    destination = "/tmp/start_besu_node.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/start_besu_node.sh",
+      "NODE_INDEX=5 S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+    ]
+  }
+}
+
+# 3f. Inicia Node-6 (validator) — paralelo com Node-2, após ambos os bootnodes
+resource "null_resource" "start_node6" {
+  depends_on = [null_resource.start_node1, null_resource.start_node3]
+
+  connection {
+    type        = "ssh"
+    user        = "ubuntu"
+    private_key = file(var.private_key_path)
+    host        = aws_instance.besu_node[5].public_ip
+    agent       = false
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/scripts/start_besu_node.sh"
+    destination = "/tmp/start_besu_node.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/start_besu_node.sh",
+      "NODE_INDEX=6 S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+    ]
+  }
+}
+
+# 4. Aguarda a rede Besu estar operacional: RPC respondendo E 5 peers conectados (todos os demais nós)
 resource "null_resource" "wait_network_ready" {
-  depends_on = [null_resource.start_node1, null_resource.start_node2]
+  depends_on = [
+    null_resource.start_node1,
+    null_resource.start_node2,
+    null_resource.start_node3,
+    null_resource.start_node4,
+    null_resource.start_node5,
+    null_resource.start_node6,
+  ]
 
   provisioner "local-exec" {
     command = <<-EOT
-      echo "Aguardando Node-1 ter peers conectados (net_peerCount >= 0x1)..."
-      for i in $(seq 1 40); do
+      echo "Aguardando Node-1 ter 5 peers conectados (net_peerCount >= 0x5)..."
+      for i in $(seq 1 60); do
         sleep 15
         RESULT=$(curl -s --max-time 5 -X POST \
           --data '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
           http://${aws_eip.node1.public_ip}:8545 2>/dev/null || true)
         PEERS=$(echo "$RESULT" | grep -o '"result":"0x[^"]*"' | grep -o '0x[0-9a-f]*' || true)
-        if [ -n "$PEERS" ] && [ "$PEERS" != "0x0" ]; then
-          echo "Rede com peers após $((i * 15))s — peerCount: $PEERS"
+        if [ -n "$PEERS" ] && [ "$PEERS" = "0x5" ]; then
+          echo "Rede com 5 peers após $((i * 15))s — peerCount: $PEERS"
           exit 0
         fi
-        echo "Tentativa $i/40: peers=$PEERS (aguardando >= 0x1)..."
+        echo "Tentativa $i/60: peers=$PEERS (aguardando 0x5)..."
       done
-      echo "Timeout aguardando peers na rede Besu"
+      echo "Timeout aguardando 5 peers na rede Besu"
       exit 1
     EOT
   }
@@ -526,7 +652,7 @@ resource "null_resource" "run_caliper_tests" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/run_caliper_tests.sh",
-      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} NODE1_PRIVATE_IP=10.0.1.10 NODE2_PRIVATE_IP=10.0.1.11 bash /tmp/run_caliper_tests.sh",
+      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} NODE1_PRIVATE_IP=10.0.1.10 NODE2_PRIVATE_IP=10.0.1.11 NODE3_PRIVATE_IP=10.0.1.12 NODE4_PRIVATE_IP=10.0.1.13 NODE5_PRIVATE_IP=10.0.1.14 NODE6_PRIVATE_IP=10.0.1.15 bash /tmp/run_caliper_tests.sh",
     ]
   }
 }

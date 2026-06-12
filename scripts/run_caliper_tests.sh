@@ -15,6 +15,10 @@ KEY_DIR="/home/ubuntu/besu-keys"
 : "${AWS_REGION:?AWS_REGION não definido}"
 : "${NODE1_PRIVATE_IP:?NODE1_PRIVATE_IP não definido}"
 : "${NODE2_PRIVATE_IP:?NODE2_PRIVATE_IP não definido}"
+: "${NODE3_PRIVATE_IP:?NODE3_PRIVATE_IP não definido}"
+: "${NODE4_PRIVATE_IP:?NODE4_PRIVATE_IP não definido}"
+: "${NODE5_PRIVATE_IP:?NODE5_PRIVATE_IP não definido}"
+: "${NODE6_PRIVATE_IP:?NODE6_PRIVATE_IP não definido}"
 
 NODE1_RPC="http://${NODE1_PRIVATE_IP}:8545"
 NODE1_WS="ws://${NODE1_PRIVATE_IP}:8645"
@@ -281,6 +285,18 @@ scrape_configs:
       - targets: ['${NODE2_PRIVATE_IP}:9546']
         labels:
           instance: node2
+      - targets: ['${NODE3_PRIVATE_IP}:9545']
+        labels:
+          instance: node3
+      - targets: ['${NODE4_PRIVATE_IP}:9546']
+        labels:
+          instance: node4
+      - targets: ['${NODE5_PRIVATE_IP}:9546']
+        labels:
+          instance: node5
+      - targets: ['${NODE6_PRIVATE_IP}:9546']
+        labels:
+          instance: node6
 PROMEOF
 
 log "Iniciando Prometheus em background (porta 9090)..."
@@ -307,14 +323,14 @@ log "Aguardando primeiro scrape dos nós Besu..."
 for i in $(seq 1 12); do
   UP=$(curl -s "http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22besu%22%7D" \
     | python3 -c "import sys,json; r=json.load(sys.stdin); print(sum(1 for x in r['data']['result'] if x['value'][1]=='1'))" 2>/dev/null || echo 0)
-  if [ "$UP" -eq 2 ]; then
-    log "Ambos os nós Besu respondendo ao Prometheus"
+  if [ "$UP" -eq 6 ]; then
+    log "Todos os 6 nós Besu respondendo ao Prometheus"
     break
   fi
-  log "Aguardando scrape dos nós Besu ($UP/2 up)... ($i/12)"
+  log "Aguardando scrape dos nós Besu ($UP/6 up)... ($i/12)"
   sleep 5
 done
-[ "$UP" -eq 2 ] || log "AVISO: nem todos os nós estão sendo scraped (UP=$UP). Verifique métricas após o teste."
+[ "$UP" -eq 6 ] || log "AVISO: nem todos os nós estão sendo scraped (UP=$UP/6). Verifique métricas após o teste."
 
 # ============================================================================
 # Passo 11 — Executar os testes com Caliper

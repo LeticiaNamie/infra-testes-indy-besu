@@ -15,12 +15,12 @@ BESU_TAR="besu-24.7.0.tar.gz"
 : "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
 : "${AWS_REGION:?AWS_REGION não definido}"
 
-# Node-1 usa docker-compose.bootnode.yaml (RPC em 8545)
-# Node-2 usa docker-compose.validator.yaml  (RPC em 8546)
-if [ "$NODE_INDEX" = "1" ]; then
+# Node-1 e Node-3: bootnodes → docker-compose.bootnode.yaml (RPC em 8545)
+# Node-2, 4, 5, 6: validators → docker-compose.validator.yaml (RPC em 8546)
+if [ "$NODE_INDEX" = "1" ] || [ "$NODE_INDEX" = "3" ]; then
   COMPOSE_FILE="docker-compose.bootnode.yaml"
   RPC_PORT=8545
-elif [ "$NODE_INDEX" = "2" ]; then
+elif [ "$NODE_INDEX" = "2" ] || [ "$NODE_INDEX" = "4" ] || [ "$NODE_INDEX" = "5" ] || [ "$NODE_INDEX" = "6" ]; then
   COMPOSE_FILE="docker-compose.validator.yaml"
   RPC_PORT=8546
 else
@@ -39,8 +39,9 @@ check() {
 
 log "=== Iniciando Node-$NODE_INDEX com $COMPOSE_FILE ==="
 
-# Node-2: precisa clonar o repo e baixar o que Node-1 gerou
-if [ "$NODE_INDEX" = "2" ]; then
+# Todos os nós exceto Node-1 precisam clonar o repo e baixar chaves do S3
+# (Node-1 já tem o repo clonado de generate_and_distribute_keys.sh)
+if [ "$NODE_INDEX" != "1" ]; then
   if [ -d "$REPO_ROOT" ]; then rm -rf "$REPO_ROOT"; fi
   git clone https://github.com/LeticiaNamie/besu-production-docker-distributed.git "$REPO_ROOT"
   check "Clone do repositório"
@@ -59,10 +60,18 @@ if [ "$NODE_INDEX" = "2" ]; then
   tar -xf "$BESU_TAR" && rm -f "$BESU_TAR"
   check "Extração do Besu"
 
-  # Cria a estrutura de diretórios do nó
-  NODE_DATA="$REPO_ROOT/Permissioned-Network/Node-$NODE_INDEX/data"
+  # O caminho de dados deve coincidir com o volume mount do compose file:
+  # bootnode.yaml → Permissioned-Network/Node-1/data
+  # validator.yaml → Permissioned-Network/Node-2/data
+  # Como cada nó está em EC2 próprio, Node-3 coloca suas chaves em Node-1/data/
+  # e Node-4/5/6 colocam em Node-2/data/ — o que o compose file espera encontrar.
+  if [ "$COMPOSE_FILE" = "docker-compose.bootnode.yaml" ]; then
+    NODE_DATA="$REPO_ROOT/Permissioned-Network/Node-1/data"
+  else
+    NODE_DATA="$REPO_ROOT/Permissioned-Network/Node-2/data"
+  fi
   mkdir -p "$NODE_DATA"
-  check "Criação do diretório de dados do Node-$NODE_INDEX"
+  check "Criação do diretório de dados ($NODE_DATA)"
 
   # Baixa chaves e configurações do S3
   log "Baixando chaves e configs do S3..."
@@ -77,12 +86,15 @@ if [ "$NODE_INDEX" = "2" ]; then
   aws s3 cp "s3://$S3_KEYS_BUCKET/shared/genesis.json" "$REPO_ROOT/genesis.json" --region "$AWS_REGION"
   check "genesis.json copiado para raiz do repositório"
 
-  # Sobrescreve o docker-compose.validator.yaml com a versão patchada (--bootnodes já ajustado)
-  aws s3 cp "s3://$S3_KEYS_BUCKET/shared/docker-compose.validator.yaml" "$REPO_ROOT/docker-compose.validator.yaml" --region "$AWS_REGION"
-  check "docker-compose.validator.yaml patchado baixado do S3"
+  # Validators (2, 4, 5, 6): substitui docker-compose.validator.yaml pela versão
+  # patchada do S3 (--bootnodes já aponta para Node-1 e Node-3)
+  if [ "$COMPOSE_FILE" = "docker-compose.validator.yaml" ]; then
+    aws s3 cp "s3://$S3_KEYS_BUCKET/shared/docker-compose.validator.yaml" "$REPO_ROOT/docker-compose.validator.yaml" --region "$AWS_REGION"
+    check "docker-compose.validator.yaml patchado baixado do S3"
 
-  log "Verificando --bootnodes no compose:"
-  grep -i "bootnodes" "$REPO_ROOT/docker-compose.validator.yaml" | tee -a "$LOG_FILE"
+    log "Verificando --bootnodes no compose:"
+    grep -i "bootnodes" "$REPO_ROOT/docker-compose.validator.yaml" | tee -a "$LOG_FILE"
+  fi
 fi
 
 cd "$REPO_ROOT"
@@ -93,6 +105,12 @@ if [ "$NODE_INDEX" = "1" ] && ! grep -q "rpc-ws-host" "$COMPOSE_FILE"; then
   sed -i '/--rpc-ws-port=8645/a\      --rpc-ws-host=0.0.0.0' "$COMPOSE_FILE"
   log "Adicionado --rpc-ws-host=0.0.0.0 ao $COMPOSE_FILE"
 fi
+
+# Corrige --p2p-port para o nó correto (cada nó tem porta única no static-nodes.json)
+# Node-1→30303, Node-2→30304, Node-3→30305, Node-4→30306, Node-5→30307, Node-6→30308
+P2P_PORT=$((30302 + NODE_INDEX))
+sed -i "s/--p2p-port=[0-9]*/--p2p-port=$P2P_PORT/" "$COMPOSE_FILE"
+log "p2p-port configurado para $P2P_PORT no Node-$NODE_INDEX"
 
 # Verifica que o compose file correto existe
 if [ ! -f "$COMPOSE_FILE" ]; then
