@@ -10,10 +10,22 @@ variable "aws_az" {
   description = "Availability Zone onde todas as instâncias serão criadas (tráfego intra-AZ via IP privado é gratuito)."
 }
 
-variable "instance_type" {
+variable "instance_type_node1" {
   type        = string
-  default     = "t3.medium"
-  description = "Tipo da instância EC2 para os nós Besu."
+  default     = "c6i.2xlarge"
+  description = "Tipo da instância EC2 para o Node-1 (bootnode primário + endpoint RPC do Caliper)."
+}
+
+variable "instance_type_besu" {
+  type        = string
+  default     = "c6i.xlarge"
+  description = "Tipo da instância EC2 para os nós Besu 2-6 (validators e bootnode secundário)."
+}
+
+variable "instance_type_caliper" {
+  type        = string
+  default     = "c6i.xlarge"
+  description = "Tipo da instância EC2 para o Caliper (1 worker, I/O bound)."
 }
 
 variable "node_subnet_cidr" {

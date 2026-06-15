@@ -230,13 +230,17 @@ resource "aws_instance" "besu_node" {
   count = 6
 
   ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type
+  instance_type               = count.index == 0 ? var.instance_type_node1 : var.instance_type_besu
   subnet_id                   = aws_subnet.besu.id
   vpc_security_group_ids      = [aws_security_group.besu_nodes.id]
   key_name                    = aws_key_pair.besu.key_name
   associate_public_ip_address = true
   iam_instance_profile        = aws_iam_instance_profile.besu_node.name
   private_ip                  = "10.0.1.${10 + count.index}"
+
+  root_block_device {
+    volume_type = "gp3"
+  }
 
   user_data = templatefile("${path.module}/scripts/node_user_data.sh", {
     node_index = count.index + 1
@@ -579,12 +583,16 @@ resource "aws_iam_instance_profile" "caliper" {
 # EC2 dedicada para o Caliper — mesma VPC, acessa Node-1 via IP privado
 resource "aws_instance" "caliper" {
   ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type
+  instance_type               = var.instance_type_caliper
   subnet_id                   = aws_subnet.besu.id
   vpc_security_group_ids      = [aws_security_group.besu_nodes.id]
   key_name                    = aws_key_pair.besu.key_name
   associate_public_ip_address = true
   iam_instance_profile        = aws_iam_instance_profile.caliper.name
+
+  root_block_device {
+    volume_type = "gp3"
+  }
 
   user_data = templatefile("${path.module}/scripts/node_user_data.sh", {
     node_index = "caliper"
