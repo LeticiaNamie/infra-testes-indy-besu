@@ -589,6 +589,7 @@ resource "aws_instance" "caliper" {
   key_name                    = aws_key_pair.besu.key_name
   associate_public_ip_address = true
   iam_instance_profile        = aws_iam_instance_profile.caliper.name
+  private_ip                  = "10.0.1.20"
 
   root_block_device {
     volume_type = "gp3"
