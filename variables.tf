@@ -56,3 +56,14 @@ variable "project_name" {
   default     = "besu-distributed"
   description = "Prefixo de nomes dos recursos AWS."
 }
+
+variable "node_count" {
+  type        = number
+  default     = 6
+  description = "Número total de nós Besu na rede (todos são validadores; Node-1 e Node-3 também exercem papel de bootnode). Mínimo QBFT: 4."
+
+  validation {
+    condition     = var.node_count >= 4 && var.node_count <= 14
+    error_message = "node_count deve estar entre 4 e 14 (QBFT requer mínimo 4 validadores)."
+  }
+}

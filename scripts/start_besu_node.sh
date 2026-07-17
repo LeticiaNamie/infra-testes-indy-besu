@@ -16,16 +16,13 @@ BESU_TAR="besu-24.7.0.tar.gz"
 : "${AWS_REGION:?AWS_REGION não definido}"
 
 # Node-1 e Node-3: bootnodes → docker-compose.bootnode.yaml (RPC em 8545)
-# Node-2, 4, 5, 6: validators → docker-compose.validator.yaml (RPC em 8546)
+# Todos os demais: validators → docker-compose.validator.yaml (RPC em 8546)
 if [ "$NODE_INDEX" = "1" ] || [ "$NODE_INDEX" = "3" ]; then
   COMPOSE_FILE="docker-compose.bootnode.yaml"
   RPC_PORT=8545
-elif [ "$NODE_INDEX" = "2" ] || [ "$NODE_INDEX" = "4" ] || [ "$NODE_INDEX" = "5" ] || [ "$NODE_INDEX" = "6" ]; then
+else
   COMPOSE_FILE="docker-compose.validator.yaml"
   RPC_PORT=8546
-else
-  echo "NODE_INDEX inválido: $NODE_INDEX"
-  exit 1
 fi
 
 log() {

@@ -5,31 +5,25 @@ output "node1_public_ip" {
 
 output "node_public_ips" {
   description = "IPs públicos de todos os nós (índice 0 = Node-1 com EIP, demais auto-atribuídos)."
-  value = [
-    aws_eip.node1.public_ip,
-    aws_instance.besu_node[1].public_ip,
-    aws_instance.besu_node[2].public_ip,
-    aws_instance.besu_node[3].public_ip,
-    aws_instance.besu_node[4].public_ip,
-    aws_instance.besu_node[5].public_ip,
-  ]
+  value = concat(
+    [aws_eip.node1.public_ip],
+    [for i in range(1, var.node_count) : aws_instance.besu_node[i].public_ip]
+  )
 }
 
 output "node_private_ips" {
-  description = "IPs privados dos 6 nós dentro da VPC."
+  description = "IPs privados de todos os nós dentro da VPC."
   value       = aws_instance.besu_node[*].private_ip
 }
 
 output "ssh_commands" {
   description = "Comandos SSH para acessar cada nó."
-  value = [
-    "ssh -i ${var.private_key_path} ubuntu@${aws_eip.node1.public_ip}  # Node-1 bootnode (${aws_instance.besu_node[0].private_ip})",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[1].public_ip}  # Node-2 validator (${aws_instance.besu_node[1].private_ip})",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[2].public_ip}  # Node-3 bootnode (${aws_instance.besu_node[2].private_ip})",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[3].public_ip}  # Node-4 validator (${aws_instance.besu_node[3].private_ip})",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[4].public_ip}  # Node-5 validator (${aws_instance.besu_node[4].private_ip})",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[5].public_ip}  # Node-6 validator (${aws_instance.besu_node[5].private_ip})",
-  ]
+  value = concat(
+    ["ssh -i ${var.private_key_path} ubuntu@${aws_eip.node1.public_ip}  # Node-1 bootnode (${aws_instance.besu_node[0].private_ip})"],
+    [for i in range(1, var.node_count) :
+      "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[i].public_ip}  # Node-${i + 1} ${i == 2 ? "bootnode" : "validator"} (${aws_instance.besu_node[i].private_ip})"
+    ]
+  )
 }
 
 output "rpc_url" {
@@ -39,14 +33,12 @@ output "rpc_url" {
 
 output "log_commands" {
   description = "Comandos para acompanhar os logs de setup em cada nó."
-  value = [
-    "ssh -i ${var.private_key_path} ubuntu@${aws_eip.node1.public_ip} 'tail -f /home/ubuntu/besu-setup.log'  # Node-1",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[1].public_ip} 'tail -f /home/ubuntu/besu-setup.log'  # Node-2",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[2].public_ip} 'tail -f /home/ubuntu/besu-setup.log'  # Node-3",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[3].public_ip} 'tail -f /home/ubuntu/besu-setup.log'  # Node-4",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[4].public_ip} 'tail -f /home/ubuntu/besu-setup.log'  # Node-5",
-    "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[5].public_ip} 'tail -f /home/ubuntu/besu-setup.log'  # Node-6",
-  ]
+  value = concat(
+    ["ssh -i ${var.private_key_path} ubuntu@${aws_eip.node1.public_ip} 'tail -f /home/ubuntu/besu-setup.log'  # Node-1"],
+    [for i in range(1, var.node_count) :
+      "ssh -i ${var.private_key_path} ubuntu@${aws_instance.besu_node[i].public_ip} 'tail -f /home/ubuntu/besu-setup.log'  # Node-${i + 1}"
+    ]
+  )
 }
 
 output "s3_data_bucket" {
@@ -74,7 +66,7 @@ output "validation_commands" {
     # Verificar blockNumber no Node-1:
     curl -s -X POST --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' http://${aws_eip.node1.public_ip}:8545
 
-    # Verificar peers conectados (deve retornar 0x5 com 6 nós):
+    # Verificar peers conectados (deve retornar ${format("0x%x", var.node_count - 1)} com ${var.node_count} nós):
     curl -s -X POST --data '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' http://${aws_eip.node1.public_ip}:8545
   EOT
 }

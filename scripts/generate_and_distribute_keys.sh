@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Roda no Node-1 via remote-exec.
-# Gera chaves para os 6 nós, constrói enode URLs com IPs fixos e sobe tudo para S3.
+# Gera chaves para todos os nós, constrói enode URLs com IPs fixos e sobe tudo para S3.
 set -euo pipefail
 
 LOG_FILE="/home/ubuntu/besu-setup.log"
@@ -15,9 +15,13 @@ PERMISSIONED_DIR="$REPO_ROOT/Permissioned-Network"
 # Variáveis injetadas via env pelo Terraform (remote-exec inline)
 : "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
 : "${AWS_REGION:?AWS_REGION não definido}"
+: "${NODE_COUNT:?NODE_COUNT não definido}"
 
-# IPs privados fixos — mesma subnet, alocados pelo Terraform
-declare -A NODE_IPS=([1]="10.0.1.10" [2]="10.0.1.11" [3]="10.0.1.12" [4]="10.0.1.13" [5]="10.0.1.14" [6]="10.0.1.15")
+# IPs privados fixos — 10.0.1.10 + (index-1), ex: Node-1=10.0.1.10, Node-7=10.0.1.16
+declare -A NODE_IPS
+for i in $(seq 1 $NODE_COUNT); do
+  NODE_IPS[$i]="10.0.1.$((9 + i))"
+done
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -28,7 +32,7 @@ check() {
   log "OK: $1"
 }
 
-log "=== Gerando e distribuindo chaves para a rede Besu distribuída (6 nós) ==="
+log "=== Gerando e distribuindo chaves para a rede Besu distribuída ($NODE_COUNT nós) ==="
 
 # Clone do repositório adaptado para distribuição
 if [ -d "$REPO_ROOT" ]; then rm -rf "$REPO_ROOT"; fi
@@ -60,6 +64,13 @@ check "Java disponível"
 "$REPO_ROOT/$BESU_DIR/bin/besu" --version | grep -q "24.7.0"
 check "Besu 24.7.0 disponível"
 
+# Patch do genesis_QBFT.json — substitui o count pelo número correto de nós
+log "Patchando genesis_QBFT.json para $NODE_COUNT nós..."
+jq ".blockchain.nodes.count = $NODE_COUNT" genesis_QBFT.json > /tmp/genesis_patched.json
+mv /tmp/genesis_patched.json genesis_QBFT.json
+check "Patch do genesis_QBFT.json (count=$NODE_COUNT)"
+log "genesis_QBFT.json patchado: count=$(jq '.blockchain.nodes.count' genesis_QBFT.json)"
+
 # Gera chaves criptográficas e genesis via besu operator
 log "Gerando blockchain config..."
 "$REPO_ROOT/$BESU_DIR/bin/besu" operator generate-blockchain-config \
@@ -71,7 +82,7 @@ check "besu operator generate-blockchain-config"
 cp "$REPO_ROOT/networkFiles/genesis.json" "$REPO_ROOT/genesis.json"
 check "Cópia do genesis.json para raiz"
 
-# Cria estrutura Permissioned-Network se o script do repo não fizer isso
+# Cria estrutura Permissioned-Network (o script do repo já é dinâmico — usa tudo que foi gerado)
 if [ -f "$REPO_ROOT/generate-nodes-config.sh" ]; then
   log "Executando generate-nodes-config.sh do repositório..."
   chmod +x "$REPO_ROOT/generate-nodes-config.sh"
@@ -79,9 +90,8 @@ if [ -f "$REPO_ROOT/generate-nodes-config.sh" ]; then
   check "generate-nodes-config.sh"
 else
   log "generate-nodes-config.sh não encontrado — criando estrutura manualmente"
-  # Descobre os endereços gerados e cria Node-1..Node-6
   KEY_DIRS=("$REPO_ROOT/networkFiles/keys"/*)
-  for i in 1 2 3 4 5 6; do
+  for i in $(seq 1 $NODE_COUNT); do
     NODE_DIR="$PERMISSIONED_DIR/Node-$i/data"
     mkdir -p "$NODE_DIR"
     SRC_DIR="${KEY_DIRS[$((i-1))]}"
@@ -91,18 +101,17 @@ else
   done
 fi
 
-# Valida que os diretórios e chaves existem
-for i in 1 2 3 4 5 6; do
+# Valida que os diretórios e chaves existem para todos os N nós
+for i in $(seq 1 $NODE_COUNT); do
   if [ ! -f "$PERMISSIONED_DIR/Node-$i/data/key.pub" ]; then
     log "ERRO: key.pub não encontrado em Node-$i/data"
     exit 1
   fi
 done
-check "Estrutura de diretórios dos 6 nós validada"
+check "Estrutura de diretórios dos $NODE_COUNT nós validada"
 
 # Patch do permissions_config.toml — substitui o IP placeholder pelo IP fixo correto
 # de cada nó, identificando cada entrada pela sua pubkey.
-# O permissions_config.toml é a fonte da verdade: porta e pubkey já estão corretos.
 PERMISSIONS_TOML="$PERMISSIONED_DIR/permissions_config.toml"
 
 if [ ! -f "$PERMISSIONS_TOML" ]; then
@@ -137,40 +146,37 @@ new_text = re.sub(r'enode://[^\s"\']+', replace_ip, text)
 open(toml_path, 'w').write(new_text)
 EOF
 
-PUBKEY1=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-1/data/key.pub" | tr -d '[:space:]')
-PUBKEY2=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-2/data/key.pub" | tr -d '[:space:]')
-PUBKEY3=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-3/data/key.pub" | tr -d '[:space:]')
-PUBKEY4=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-4/data/key.pub" | tr -d '[:space:]')
-PUBKEY5=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-5/data/key.pub" | tr -d '[:space:]')
-PUBKEY6=$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-6/data/key.pub" | tr -d '[:space:]')
+# Coleta pubkeys dinamicamente para todos os N nós
+PUBKEYS=()
+for i in $(seq 1 $NODE_COUNT); do
+  PUBKEYS+=("$(sed 's/^0x//' "$PERMISSIONED_DIR/Node-$i/data/key.pub" | tr -d '[:space:]')")
+done
 
-python3 /tmp/patch_permissions.py "$PERMISSIONS_TOML" \
-  "$PUBKEY1" "${NODE_IPS[1]}" \
-  "$PUBKEY2" "${NODE_IPS[2]}" \
-  "$PUBKEY3" "${NODE_IPS[3]}" \
-  "$PUBKEY4" "${NODE_IPS[4]}" \
-  "$PUBKEY5" "${NODE_IPS[5]}" \
-  "$PUBKEY6" "${NODE_IPS[6]}"
+# Monta argumentos para patch_permissions.py: pubkey1 ip1 pubkey2 ip2 ...
+PATCH_ARGS=("$PERMISSIONS_TOML")
+for i in $(seq 1 $NODE_COUNT); do
+  PATCH_ARGS+=("${PUBKEYS[$((i-1))]}" "${NODE_IPS[$i]}")
+done
+python3 /tmp/patch_permissions.py "${PATCH_ARGS[@]}"
 check "Patch de IPs no permissions_config.toml"
 
 log "permissions_config.toml após patch:"
 grep "enode://" "$PERMISSIONS_TOML" | tee -a "$LOG_FILE"
 
-# Extrai enodes do permissions_config.toml patchado — portas já estão corretas por nó.
-# Nunca hardcodar porta: o Node-2 usa 30304, não 30303.
+# Extrai enodes do permissions_config.toml patchado para static-nodes.json
+# O filtro '@10.0.1.' já cobre todos os N nós (IPs 10.0.1.10 a 10.0.1.N+9)
 log "Extraindo enodes do permissions_config.toml patchado para static-nodes.json..."
 STATIC_NODES_JSON=$(python3 -c "
 import re, json, sys
 text = open(sys.argv[1]).read()
 items = re.findall(r'enode://[^\s\"\']+', text)
-# Filtra apenas os 6 nós gerenciados (10.0.1.10 a 10.0.1.15)
 managed = [e for e in items if '@10.0.1.' in e]
 print(json.dumps(managed, indent=2))
 " "$PERMISSIONS_TOML")
 check "Extração dos enodes para static-nodes.json"
 log "static-nodes.json: $STATIC_NODES_JSON"
 
-# Extrai enode do Node-1 e Node-3 (ambos são bootnodes)
+# Extrai enode do Node-1 (10.0.1.10) e Node-3 (10.0.1.12) — sempre os 2 bootnodes
 ENODE_NODE1=$(python3 -c "
 import re, sys
 text = open(sys.argv[1]).read()
@@ -195,12 +201,11 @@ print(node3[0])
 check "Extração do enode do Node-3"
 log "Node-3 enode (bootnode): $ENODE_NODE3"
 
-# String de bootnodes: Node-1 e Node-3 para os validators (Node-2, 4, 5, 6)
 BOOTNODES="${ENODE_NODE1},${ENODE_NODE3}"
 log "Bootnodes para validators: $BOOTNODES"
 
-# Distribui genesis, static-nodes e permissions para cada nó
-for i in 1 2 3 4 5 6; do
+# Distribui genesis, static-nodes e permissions para todos os N nós
+for i in $(seq 1 $NODE_COUNT); do
   NODE_DATA="$PERMISSIONED_DIR/Node-$i/data"
   echo "$STATIC_NODES_JSON" > "$NODE_DATA/static-nodes.json"
   cp "$PERMISSIONS_TOML" "$NODE_DATA/permissions_config.toml"
@@ -208,8 +213,7 @@ for i in 1 2 3 4 5 6; do
   check "Arquivos de configuração distribuídos para Node-$i"
 done
 
-# Patch do docker-compose.validator.yaml — substitui --bootnodes pelos enodes
-# de ambos os bootnodes (Node-1 e Node-3)
+# Patch do docker-compose.validator.yaml — substitui --bootnodes pelos enodes de Node-1 e Node-3
 VALIDATOR_COMPOSE="$REPO_ROOT/docker-compose.validator.yaml"
 if [ ! -f "$VALIDATOR_COMPOSE" ]; then
   log "ERRO: $VALIDATOR_COMPOSE não encontrado"
@@ -239,7 +243,7 @@ grep -i "bootnodes" "$VALIDATOR_COMPOSE" | tee -a "$LOG_FILE"
 
 # Upload para S3 — chaves por nó + arquivos compartilhados
 log "Fazendo upload das chaves e configurações para S3..."
-for i in 1 2 3 4 5 6; do
+for i in $(seq 1 $NODE_COUNT); do
   NODE_DATA="$PERMISSIONED_DIR/Node-$i/data"
   aws s3 cp "$NODE_DATA/key"     "s3://$S3_KEYS_BUCKET/node-$i/key"     --region "$AWS_REGION"
   aws s3 cp "$NODE_DATA/key.pub" "s3://$S3_KEYS_BUCKET/node-$i/key.pub" --region "$AWS_REGION"
@@ -253,14 +257,13 @@ aws s3 cp "$VALIDATOR_COMPOSE"                                   "s3://$S3_KEYS_
 check "Arquivos compartilhados enviados para S3"
 
 log "=== Geração e distribuição de chaves concluída com sucesso ==="
-log "Node-1 enode (bootnode): $ENODE_NODE1"
-log "Node-3 enode (bootnode): $ENODE_NODE3"
-for i in 2 4 5 6; do
+for i in $(seq 1 $NODE_COUNT); do
+  IP="${NODE_IPS[$i]}"
   ENODE_NODE=$(python3 -c "
 import re, sys
 text = open(sys.argv[1]).read()
 items = re.findall(r'enode://[^\s\"\']+', text)
-node = [e for e in items if '@${NODE_IPS[$i]}:' in e]
+node = [e for e in items if '@${IP}:' in e]
 print(node[0] if node else '(nao encontrado)')
 " "$PERMISSIONS_TOML")
   log "Node-$i enode: $ENODE_NODE"

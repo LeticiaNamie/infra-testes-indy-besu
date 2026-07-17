@@ -14,11 +14,7 @@ KEY_DIR="/home/ubuntu/besu-keys"
 : "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
 : "${AWS_REGION:?AWS_REGION não definido}"
 : "${NODE1_PRIVATE_IP:?NODE1_PRIVATE_IP não definido}"
-: "${NODE2_PRIVATE_IP:?NODE2_PRIVATE_IP não definido}"
-: "${NODE3_PRIVATE_IP:?NODE3_PRIVATE_IP não definido}"
-: "${NODE4_PRIVATE_IP:?NODE4_PRIVATE_IP não definido}"
-: "${NODE5_PRIVATE_IP:?NODE5_PRIVATE_IP não definido}"
-: "${NODE6_PRIVATE_IP:?NODE6_PRIVATE_IP não definido}"
+: "${NODE_COUNT:?NODE_COUNT não definido}"
 
 NODE1_RPC="http://${NODE1_PRIVATE_IP}:8545"
 NODE1_WS="ws://${NODE1_PRIVATE_IP}:8645"
@@ -120,6 +116,38 @@ check "Clone do repositório tests-with-caliper"
   log "ERRO: diretório src/ não encontrado em $CALIPER_ROOT"
   exit 1
 }
+
+# ============================================================================
+# Passo 5.5 — Patchar campo include do monitor Prometheus nas configs do Caliper
+# ============================================================================
+# Cada config YAML tem: include: ["node1", "node2", ..., "node6"]
+# Substitui pela lista correta para N nós.
+log "Patchando include do monitor Prometheus para $NODE_COUNT nós..."
+python3 << PYEOF
+import os, re, glob
+
+node_count = int(os.environ['NODE_COUNT'])
+bench_dir = "$CALIPER_ROOT/benchmarks"
+
+if not os.path.isdir(bench_dir):
+    print(f'AVISO: {bench_dir} não encontrado, pulando patch')
+    exit(0)
+
+new_list = '[' + ', '.join(f'"node{i}"' for i in range(1, node_count + 1)) + ']'
+pattern = re.compile(r'( *include: )\[(?:"node\d+",?\s*)+\]')
+
+patched = 0
+for path in glob.glob(bench_dir + '/**/*.yaml', recursive=True):
+    text = open(path).read()
+    new_text = pattern.sub(lambda m: m.group(1) + new_list, text)
+    if new_text != text:
+        open(path, 'w').write(new_text)
+        print(f'Patchado: {os.path.basename(path)} → {new_list}')
+        patched += 1
+
+print(f'{patched} arquivo(s) patchado(s) para {node_count} nós')
+PYEOF
+check "Patch do include do monitor Prometheus"
 
 # ============================================================================
 # Passo 6 — Instalar Caliper CLI v0.5.0
@@ -271,33 +299,35 @@ wget -q "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERS
 tar -xzf /tmp/prometheus.tar.gz -C /tmp/
 check "Download e extração do Prometheus"
 
-cat > /tmp/prometheus.yml << PROMEOF
-global:
-  scrape_interval: 5s
-  evaluation_interval: 5s
+# Gera prometheus.yml dinamicamente para todos os N nós
+# Node-1 e Node-3 (bootnodes) usam porta 9545; demais (validators) usam 9546
+python3 << PYEOF
+import os
 
-scrape_configs:
-  - job_name: besu
-    static_configs:
-      - targets: ['${NODE1_PRIVATE_IP}:9545']
-        labels:
-          instance: node1
-      - targets: ['${NODE2_PRIVATE_IP}:9546']
-        labels:
-          instance: node2
-      - targets: ['${NODE3_PRIVATE_IP}:9545']
-        labels:
-          instance: node3
-      - targets: ['${NODE4_PRIVATE_IP}:9546']
-        labels:
-          instance: node4
-      - targets: ['${NODE5_PRIVATE_IP}:9546']
-        labels:
-          instance: node5
-      - targets: ['${NODE6_PRIVATE_IP}:9546']
-        labels:
-          instance: node6
-PROMEOF
+node_count = int(os.environ['NODE_COUNT'])
+
+lines = [
+    "global:",
+    "  scrape_interval: 5s",
+    "  evaluation_interval: 5s",
+    "",
+    "scrape_configs:",
+    "  - job_name: besu",
+    "    static_configs:",
+]
+
+for i in range(1, node_count + 1):
+    ip = f"10.0.1.{9 + i}"
+    port = 9545 if i in (1, 3) else 9546
+    lines.append(f"      - targets: ['{ip}:{port}']")
+    lines.append(f"        labels:")
+    lines.append(f"          instance: node{i}")
+
+with open('/tmp/prometheus.yml', 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+
+print(f"prometheus.yml gerado para {node_count} nós")
+PYEOF
 
 log "Iniciando Prometheus em background (porta 9090)..."
 /tmp/prometheus-${PROM_VERSION}.linux-amd64/prometheus \
@@ -323,14 +353,14 @@ log "Aguardando primeiro scrape dos nós Besu..."
 for i in $(seq 1 12); do
   UP=$(curl -s "http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22besu%22%7D" \
     | python3 -c "import sys,json; r=json.load(sys.stdin); print(sum(1 for x in r['data']['result'] if x['value'][1]=='1'))" 2>/dev/null || echo 0)
-  if [ "$UP" -eq 6 ]; then
-    log "Todos os 6 nós Besu respondendo ao Prometheus"
+  if [ "$UP" -eq "$NODE_COUNT" ]; then
+    log "Todos os $NODE_COUNT nós Besu respondendo ao Prometheus"
     break
   fi
-  log "Aguardando scrape dos nós Besu ($UP/6 up)... ($i/12)"
+  log "Aguardando scrape dos nós Besu ($UP/$NODE_COUNT up)... ($i/12)"
   sleep 5
 done
-[ "$UP" -eq 6 ] || log "AVISO: nem todos os nós estão sendo scraped (UP=$UP/6). Verifique métricas após o teste."
+[ "$UP" -eq "$NODE_COUNT" ] || log "AVISO: nem todos os nós estão sendo scraped (UP=$UP/$NODE_COUNT). Verifique métricas após o teste."
 
 # ============================================================================
 # Passo 11 — Executar os testes com Caliper
