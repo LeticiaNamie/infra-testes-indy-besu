@@ -16,6 +16,7 @@ PERMISSIONED_DIR="$REPO_ROOT/Permissioned-Network"
 : "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
 : "${AWS_REGION:?AWS_REGION não definido}"
 : "${NODE_COUNT:?NODE_COUNT não definido}"
+: "${TOTAL_CALIPER_WORKERS:?TOTAL_CALIPER_WORKERS não definido}"
 
 # IPs privados fixos — 10.0.1.10 + (index-1), ex: Node-1=10.0.1.10, Node-7=10.0.1.16
 declare -A NODE_IPS
@@ -119,6 +120,66 @@ if [ ! -f "$PERMISSIONS_TOML" ]; then
   exit 1
 fi
 check "Verificação do permissions_config.toml gerado pelo repositório"
+
+# Contas dos workers do Caliper — derivadas dinamicamente da MESMA seed usada em
+# tests-with-caliper/.../networks/besu/networkconfig.json → fromAddressSeed,
+# com o MESMO esquema (m/44'/60'/{workerIndex}'/0/0) que ethereum-connector.js
+# usa em runtime pra cada worker. Cobre TOTAL_CALIPER_WORKERS contas (0..N-1),
+# calculado no Terraform a partir de caliper_a_workers/caliper_b_workers/
+# node_caliper_count — antes era uma lista fixa de 32, que passou a ser
+# insuficiente quando node_caliper_count cresceu além disso (workers com índice
+# >= 32 derivavam conta fora do allowlist e tinham toda transação rejeitada
+# no permissionamento, inflando o Fail sem relação com capacidade real da rede).
+#
+# ATENÇÃO: se "fromAddressSeed" mudar no networkconfig.json, precisa mudar
+# CALIPER_SEED aqui também — são independentes, não há leitura cruzada.
+CALIPER_SEED="0c1db9de96da5d09500307ceed81d5827c0ecc08662efc9d5c02f7a43aee1300"
+
+log "Derivando $TOTAL_CALIPER_WORKERS contas de worker do Caliper (seed fixa)..."
+if ! command -v node &>/dev/null; then
+  log "Instalando Node.js v18 (necessário só pra derivação de contas)..."
+  curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - 2>>"$LOG_FILE"
+  sudo apt-get install -y nodejs 2>>"$LOG_FILE"
+  check "Node.js instalado"
+fi
+
+DERIVE_DIR="/tmp/derive-worker-accounts"
+mkdir -p "$DERIVE_DIR"
+# Versão fixada em 0.6.5 de propósito: é a que o restante do projeto realmente usa
+# (confirmado no node_modules do tests-with-caliper) — a 1.x reestruturou o pacote
+# e não tem mais o subpath "/hdkey", além de (nunca testado) poder derivar
+# endereços diferentes pra mesma seed/path.
+(cd "$DERIVE_DIR" && npm install --no-save ethereumjs-wallet@0.6.5 2>>"$LOG_FILE")
+check "ethereumjs-wallet@0.6.5 instalado para derivação"
+
+mapfile -t WORKER_ACCOUNTS < <(node -e "
+const EthereumHDKey = require('$DERIVE_DIR/node_modules/ethereumjs-wallet/hdkey');
+const hdwallet = EthereumHDKey.fromMasterSeed('$CALIPER_SEED');
+for (let i = 0; i < $TOTAL_CALIPER_WORKERS; i++) {
+  const wallet = hdwallet.derivePath(\"m/44'/60'/\" + i + \"'/0/0\").getWallet();
+  console.log(wallet.getChecksumAddressString().toLowerCase());
+}
+")
+if [ "${#WORKER_ACCOUNTS[@]}" -ne "$TOTAL_CALIPER_WORKERS" ]; then
+  log "ERRO: derivadas ${#WORKER_ACCOUNTS[@]} contas, esperava $TOTAL_CALIPER_WORKERS"
+  exit 1
+fi
+check "Derivação das $TOTAL_CALIPER_WORKERS contas de worker"
+
+log "Adicionando contas dos workers do Caliper ao accounts-allowlist..."
+python3 - "$PERMISSIONS_TOML" "${WORKER_ACCOUNTS[@]}" << 'EOF'
+import re, sys
+path, new_accounts = sys.argv[1], sys.argv[2:]
+text = open(path).read()
+match = re.search(r'accounts-allowlist=\[(.*)\]', text)
+existing = [a.strip().strip('"') for a in match.group(1).split(',') if a.strip()]
+merged = list(dict.fromkeys(existing + new_accounts))
+new_line = 'accounts-allowlist=[' + ','.join(f'"{a}"' for a in merged) + ']'
+text = re.sub(r'accounts-allowlist=\[.*\]', new_line, text)
+open(path, 'w').write(text)
+print(f"accounts-allowlist agora com {len(merged)} entradas")
+EOF
+check "Contas dos workers adicionadas ao accounts-allowlist"
 
 log "Conteúdo original do permissions_config.toml:"
 cat "$PERMISSIONS_TOML" | tee -a "$LOG_FILE"

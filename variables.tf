@@ -24,8 +24,8 @@ variable "instance_type_besu" {
 
 variable "instance_type_caliper" {
   type        = string
-  default     = "c6i.xlarge"
-  description = "Tipo da instância EC2 para o Caliper (1 worker, I/O bound)."
+  default     = "m6i.4xlarge"
+  description = "Tipo da instância EC2 para o Caliper (16 vCPUs, memory-optimized). c6i.2xlarge já mostrou CPU/RAM com folga enorme (88-99% idle, 73% RAM livre) no teto de Send Rate ~600-645 TPS — esse upgrade é pra descartar de vez recurso do cliente antes de investigar rede/RPC do Node-1."
 }
 
 variable "node_subnet_cidr" {
@@ -66,4 +66,33 @@ variable "node_count" {
     condition     = var.node_count >= 4 && var.node_count <= 14
     error_message = "node_count deve estar entre 4 e 14 (QBFT requer mínimo 4 validadores)."
   }
+}
+
+variable "node_caliper_count" {
+  type        = number
+  default     = 1
+  description = "Número total de instâncias EC2 do Caliper (mesmo padrão de node_count pros nós Besu). 1 (padrão) = só a instância A, rodando a varredura automática de sempre (run_test_local.py), sem MQTT — comportamento inalterado. >1 = instância A vira manager (SKIP_SWEEP=true, varredura automática desligada) + (node_caliper_count - 1) instâncias extras rodando só workers remotos via MQTT, orquestradas do laptop do operador por scripts/run_distributed_sweep.py (não pelo terraform apply)."
+
+  validation {
+    condition     = var.node_caliper_count >= 1
+    error_message = "node_caliper_count deve ser >= 1."
+  }
+}
+
+variable "instance_type_caliper_b" {
+  type        = string
+  default     = "m6i.4xlarge"
+  description = "Tipo da instância EC2 para o Caliper B (só workers remotos, sem manager/Prometheus)."
+}
+
+variable "caliper_a_workers" {
+  type        = number
+  default     = 10
+  description = "Quantidade de workers locais lançados na instância A (manager). Some com caliper_b_workers para o total do workers.number no YAML do round distribuído."
+}
+
+variable "caliper_b_workers" {
+  type        = number
+  default     = 10
+  description = "Quantidade de workers remotos lançados em CADA instância extra, conectados via MQTT ao manager da instância A. Ignorado se node_caliper_count <= 1."
 }
