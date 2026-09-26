@@ -10,8 +10,10 @@ CONTRACTS_ROOT="/home/ubuntu/contracts-indy-besu"
 KEY_FILE="/home/ubuntu/besu-production-docker-distributed/Permissioned-Network/Node-1/data/key"
 DEPLOY_ARTIFACTS_DIR="/home/ubuntu/deploy-artifacts"
 
-: "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
-: "${AWS_REGION:?AWS_REGION não definido}"
+: "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT não definido}"
+: "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER não definido}"
+: "${AZURE_IDENTITY_CLIENT_ID:?AZURE_IDENTITY_CLIENT_ID não definido}"
+BLOB_BASE="https://$AZURE_STORAGE_ACCOUNT.blob.core.windows.net/$AZURE_STORAGE_CONTAINER"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -23,6 +25,9 @@ check() {
 }
 
 log "===== INICIANDO ETAPA 2 — Deploy dos Contratos Inteligentes ====="
+
+azcopy login --identity --identity-client-id="$AZURE_IDENTITY_CLIENT_ID"
+check "Login no azcopy via managed identity"
 
 # ============================================================================
 # Passo 1 — Confirma que a rede está produzindo blocos
@@ -167,21 +172,22 @@ JSON
 check "network-info.json criado"
 
 # ============================================================================
-# Passo 11 — Upload dos artefatos para S3
+# Passo 11 — Upload dos artefatos para o Azure Blob Storage
 # ============================================================================
-log "Fazendo upload dos artefatos para S3..."
-aws s3 cp "$DEPLOY_ARTIFACTS_DIR/network-info.json" \
-  "s3://$S3_KEYS_BUCKET/artifacts/network-info.json" \
-  --region "$AWS_REGION"
-check "network-info.json enviado para S3"
+log "Fazendo upload dos artefatos para o Blob Storage..."
+azcopy copy "$DEPLOY_ARTIFACTS_DIR/network-info.json" \
+  "$BLOB_BASE/artifacts/network-info.json"
+check "network-info.json enviado para o Blob Storage"
 
 if [ -d "$DEPLOY_ARTIFACTS_DIR/deployments" ]; then
-  aws s3 cp "$DEPLOY_ARTIFACTS_DIR/deployments/" \
-    "s3://$S3_KEYS_BUCKET/artifacts/deployments/" \
-    --recursive \
-    --region "$AWS_REGION"
-  check "journal Ignition enviado para S3"
+  # "/*" no fim da origem copia o CONTEÚDO do diretório (equivalente ao
+  # comportamento de "aws s3 cp dir/ dest/ --recursive") — sem o "*", o azcopy
+  # aninharia um "deployments/" extra dentro de artifacts/deployments/.
+  azcopy copy "$DEPLOY_ARTIFACTS_DIR/deployments/*" \
+    "$BLOB_BASE/artifacts/deployments/" \
+    --recursive
+  check "journal Ignition enviado para o Blob Storage"
 fi
 
-log "Artefatos disponíveis em s3://$S3_KEYS_BUCKET/artifacts/"
+log "Artefatos disponíveis em $BLOB_BASE/artifacts/"
 log "===== ETAPA 2 CONCLUÍDA COM SUCESSO ====="

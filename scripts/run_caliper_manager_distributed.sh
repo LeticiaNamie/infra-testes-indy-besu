@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Roda MANUALMENTE na instância Caliper A (manager) — não é chamado automaticamente
-# pelo terraform apply. Pressupõe que run_caliper_tests.sh já rodou nessa instância
-# (repo clonado, networkconfig.json já patchado com endereços/contratos reais).
+# Chamado automaticamente por run_distributed_sweep.py (via SSH, um round por vez),
+# que por sua vez é disparado pelo terraform apply quando node_caliper_count > 1
+# (null_resource.run_distributed_sweep em main.tf). O próprio run_distributed_sweep.py
+# envia este arquivo (scp) e dá chmod +x antes do primeiro round. Pressupõe que
+# run_caliper_tests.sh já rodou nessa instância (repo clonado, networkconfig.json
+# já patchado com endereços/contratos reais).
 #
 # Sobe um broker MQTT local, lança a fatia de workers locais desta instância, e roda
 # o manager em modo distribuído (--caliper-worker-remote), esperando também os workers
-# remotos da instância B (lançados manualmente lá com launch_workers.sh apontando pro
-# IP privado desta instância).
+# remotos da instância B — lançados por run_distributed_sweep.py
+# (launch_remote_workers(), via SSH) rodando launch_workers.sh lá, apontando pro IP
+# privado desta instância.
 #
 # Uso:
 #   ./run_caliper_manager_distributed.sh [NUM_WORKERS_LOCAIS] [BENCHMARK_FILE]
@@ -16,7 +20,7 @@ CALIPER_ROOT="/home/ubuntu/tests-with-caliper/evaluation-contracts-indy-besu"
 LOG_FILE="/home/ubuntu/besu-setup.log"
 
 NUM_WORKERS_LOCAIS="${1:-16}"
-BENCHMARK_FILE="${2:-benchmarks/scenario/IndyDidRegistry/config-createDid-distributed.yaml}"
+BENCHMARK_FILE="${2:-benchmarks/scenario/IndyDidRegistry/config-createDid.yaml}"
 FUNCTION_NAME="${3:-createDid}"
 TPS="${4:-3500}"
 BROKER_ADDRESS="mqtt://127.0.0.1:1883"
@@ -77,7 +81,7 @@ for i in $(seq 1 "$NUM_WORKERS_LOCAIS"); do
   LOCAL_WORKER_PIDS+=($!)
 done
 log "Workers locais lançados (PIDs: ${LOCAL_WORKER_PIDS[*]})"
-log "Aguardando você lançar os workers remotos na instância B (launch_workers.sh)..."
+log "Aguardando os workers remotos da instância B (lançados por run_distributed_sweep.py)..."
 
 # ============================================================================
 # Passo 3 — Rodar o manager em modo distribuído (bloqueia até o round terminar)
@@ -88,13 +92,14 @@ log "Iniciando manager em modo distribuído — aguardando todos os workers (loc
 # só precisamos desligar temporariamente o "-e" pra um manager que falhe não
 # derrubar o script antes da gente conseguir tratar o relatório/limpeza.
 set +e
-# 600s: precisa de folga confortável acima do transactionBlockTimeout configurado em
-# networkconfig.json (hoje 300 blocos, ~300s nominal) — visto na prática que um round
-# inteiro com Succ alto pode ser morto aqui antes da última tx travada estourar seu
-# próprio timeout individual, perdendo o relatório inteiro. Se transactionBlockTimeout
-# mudar, revisar esse valor (e o SSH_TIMEOUT_ROUND correspondente em
-# run_distributed_sweep.py) junto.
-timeout 600 npx caliper launch manager \
+# 1800s: precisa de folga confortável acima do transactionBlockTimeout configurado em
+# networkconfig.json (hoje 700 blocos, ~700s nominal a 1 bloco/s — dimensionado pra
+# 14 nodes/7000 TPS, onde o backlog de fila leva bem mais tempo pra drenar que a 6 nodes)
+# — visto na prática que um round inteiro com Succ alto pode ser morto aqui antes da
+# última tx travada estourar seu próprio timeout individual, perdendo o relatório
+# inteiro. Se transactionBlockTimeout mudar, revisar esse valor (e o SSH_TIMEOUT_ROUND
+# correspondente em run_distributed_sweep.py) junto.
+timeout 1800 npx caliper launch manager \
   --caliper-workspace ./ \
   --caliper-benchconfig "$BENCHMARK_FILE" \
   --caliper-networkconfig networks/besu/networkconfig.json \

@@ -1,0 +1,13 @@
+Metric,Query,Name,Value,ReportFile,Rate
+CPU(%),irate(process_cpu_seconds_total[10s]),node1,184.0,createDid_report_1000_20260922-220152.html,1000
+CPU(%),irate(process_cpu_seconds_total[10s]),node2,102.0,createDid_report_1000_20260922-220152.html,1000
+CPU(%),irate(process_cpu_seconds_total[10s]),node3,104.0,createDid_report_1000_20260922-220152.html,1000
+CPU(%),irate(process_cpu_seconds_total[10s]),node4,105.0,createDid_report_1000_20260922-220152.html,1000
+CPU(%),irate(process_cpu_seconds_total[10s]),node5,104.0,createDid_report_1000_20260922-220152.html,1000
+CPU(%),irate(process_cpu_seconds_total[10s]),node6,106.0,createDid_report_1000_20260922-220152.html,1000
+Memory(MB),process_resident_memory_bytes,node1,3500.0,createDid_report_1000_20260922-220152.html,1000
+Memory(MB),process_resident_memory_bytes,node2,1260.0,createDid_report_1000_20260922-220152.html,1000
+Memory(MB),process_resident_memory_bytes,node3,1240.0,createDid_report_1000_20260922-220152.html,1000
+Memory(MB),process_resident_memory_bytes,node4,1290.0,createDid_report_1000_20260922-220152.html,1000
+Memory(MB),process_resident_memory_bytes,node5,1220.0,createDid_report_1000_20260922-220152.html,1000
+Memory(MB),process_resident_memory_bytes,node6,1250.0,createDid_report_1000_20260922-220152.html,1000

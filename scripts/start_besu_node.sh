@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Roda em cada nó via remote-exec.
 # Node-1: o repo já existe (gerado em generate_and_distribute_keys.sh); só faz o build e sobe.
-# Node-2: clona o repo, baixa JDK/Besu, baixa chaves do S3, faz build e sobe.
+# Node-2: clona o repo, baixa JDK/Besu, baixa chaves do Blob Storage, faz build e sobe.
 set -euo pipefail
 
 LOG_FILE="/home/ubuntu/besu-setup.log"
@@ -12,8 +12,10 @@ JDK_DIR="jdk-21.0.6"
 BESU_TAR="besu-24.7.0.tar.gz"
 
 : "${NODE_INDEX:?NODE_INDEX não definido}"
-: "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
-: "${AWS_REGION:?AWS_REGION não definido}"
+: "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT não definido}"
+: "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER não definido}"
+: "${AZURE_IDENTITY_CLIENT_ID:?AZURE_IDENTITY_CLIENT_ID não definido}"
+BLOB_BASE="https://$AZURE_STORAGE_ACCOUNT.blob.core.windows.net/$AZURE_STORAGE_CONTAINER"
 
 # Node-1 e Node-3: bootnodes → docker-compose.bootnode.yaml (RPC em 8545)
 # Todos os demais: validators → docker-compose.validator.yaml (RPC em 8546)
@@ -36,7 +38,7 @@ check() {
 
 log "=== Iniciando Node-$NODE_INDEX com $COMPOSE_FILE ==="
 
-# Todos os nós exceto Node-1 precisam clonar o repo e baixar chaves do S3
+# Todos os nós exceto Node-1 precisam clonar o repo e baixar chaves do Blob Storage
 # (Node-1 já tem o repo clonado de generate_and_distribute_keys.sh)
 if [ "$NODE_INDEX" != "1" ]; then
   if [ -d "$REPO_ROOT" ]; then rm -rf "$REPO_ROOT"; fi
@@ -70,24 +72,27 @@ if [ "$NODE_INDEX" != "1" ]; then
   mkdir -p "$NODE_DATA"
   check "Criação do diretório de dados ($NODE_DATA)"
 
-  # Baixa chaves e configurações do S3
-  log "Baixando chaves e configs do S3..."
-  aws s3 cp "s3://$S3_KEYS_BUCKET/node-$NODE_INDEX/key"                "$NODE_DATA/key"                     --region "$AWS_REGION"
-  aws s3 cp "s3://$S3_KEYS_BUCKET/node-$NODE_INDEX/key.pub"            "$NODE_DATA/key.pub"                 --region "$AWS_REGION"
-  aws s3 cp "s3://$S3_KEYS_BUCKET/shared/genesis.json"                 "$NODE_DATA/genesis.json"            --region "$AWS_REGION"
-  aws s3 cp "s3://$S3_KEYS_BUCKET/shared/static-nodes.json"            "$NODE_DATA/static-nodes.json"       --region "$AWS_REGION"
-  aws s3 cp "s3://$S3_KEYS_BUCKET/shared/permissions_config.toml"      "$NODE_DATA/permissions_config.toml" --region "$AWS_REGION"
-  check "Chaves e configurações baixadas do S3"
+  azcopy login --identity --identity-client-id="$AZURE_IDENTITY_CLIENT_ID"
+  check "Login no azcopy via managed identity"
+
+  # Baixa chaves e configurações do Blob Storage
+  log "Baixando chaves e configs do Blob Storage..."
+  azcopy copy "$BLOB_BASE/node-$NODE_INDEX/key"                "$NODE_DATA/key"
+  azcopy copy "$BLOB_BASE/node-$NODE_INDEX/key.pub"            "$NODE_DATA/key.pub"
+  azcopy copy "$BLOB_BASE/shared/genesis.json"                 "$NODE_DATA/genesis.json"
+  azcopy copy "$BLOB_BASE/shared/static-nodes.json"            "$NODE_DATA/static-nodes.json"
+  azcopy copy "$BLOB_BASE/shared/permissions_config.toml"      "$NODE_DATA/permissions_config.toml"
+  check "Chaves e configurações baixadas do Blob Storage"
 
   # genesis.json também precisa estar na raiz para referências do compose
-  aws s3 cp "s3://$S3_KEYS_BUCKET/shared/genesis.json" "$REPO_ROOT/genesis.json" --region "$AWS_REGION"
+  azcopy copy "$BLOB_BASE/shared/genesis.json" "$REPO_ROOT/genesis.json"
   check "genesis.json copiado para raiz do repositório"
 
   # Validators (2, 4, 5, 6): substitui docker-compose.validator.yaml pela versão
-  # patchada do S3 (--bootnodes já aponta para Node-1 e Node-3)
+  # patchada do Blob Storage (--bootnodes já aponta para Node-1 e Node-3)
   if [ "$COMPOSE_FILE" = "docker-compose.validator.yaml" ]; then
-    aws s3 cp "s3://$S3_KEYS_BUCKET/shared/docker-compose.validator.yaml" "$REPO_ROOT/docker-compose.validator.yaml" --region "$AWS_REGION"
-    check "docker-compose.validator.yaml patchado baixado do S3"
+    azcopy copy "$BLOB_BASE/shared/docker-compose.validator.yaml" "$REPO_ROOT/docker-compose.validator.yaml"
+    check "docker-compose.validator.yaml patchado baixado do Blob Storage"
 
     log "Verificando --bootnodes no compose:"
     grep -i "bootnodes" "$REPO_ROOT/docker-compose.validator.yaml" | tee -a "$LOG_FILE"
@@ -108,6 +113,54 @@ fi
 P2P_PORT=$((30302 + NODE_INDEX))
 sed -i "s/--p2p-port=[0-9]*/--p2p-port=$P2P_PORT/" "$COMPOSE_FILE"
 log "p2p-port configurado para $P2P_PORT no Node-$NODE_INDEX"
+
+# Heap da JVM proporcional à RAM real da VM — Node-1 (16GB) e Node-3 (8GB)
+# compartilham o mesmo docker-compose.bootnode.yaml (com -Xmx3g fixo), então o
+# valor do YAML só está certo pra um dos dois. Ajusta em runtime por detecção
+# de RAM em vez de depender do valor estático do compose.
+# Faixas conforme a doc oficial do Besu (8GB→3g, 16GB→5g, 24GB+→8g):
+# https://docs.besu-eth.org/public-networks/how-to/configure-java/manage-memory
+#
+# Node-1 é exceção deliberada acima da faixa oficial: é o único endpoint RPC
+# usado pelo Caliper na varredura distribuída, e sob carga alta o heap de 5g
+# estourou (OutOfMemoryError) — causa raiz foi a fila de notificação de
+# subscriptions do Besu, não o tx pool (que já é limitado por padrão), mas
+# mais heap dá folga real numa VM dedicada só a este container, sem RAM
+# concorrente de outros processos. Só se aplica ao Node-1 — Node-3 e os
+# validators continuam na faixa oficial.
+RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+BESU_JVM_EXTRA=""
+if [ "$NODE_INDEX" = "1" ]; then
+  BESU_XMX="11g"
+  # Log de GC só no Node-1 — diagnóstico pra correlacionar pausas de GC com o
+  # travamento observado (blocos saindo com 0 tx depois que o BlockTransactionSelector
+  # passou a estourar seu orçamento de tempo). Grava em /opt/besu/data (volume do
+  # host), não dentro do container, pra sobreviver e ser lido via SSH depois.
+  BESU_JVM_EXTRA=" -Xlog:gc*:file=/opt/besu/data/gc.log:time,uptime:filecount=5,filesize=20M"
+elif [ "$RAM_GB" -ge 20 ]; then
+  BESU_XMX="8g"
+elif [ "$RAM_GB" -ge 12 ]; then
+  BESU_XMX="5g"
+else
+  BESU_XMX="3g"
+fi
+sed -i "s#BESU_OPTS=-Xmx[0-9]*g#BESU_OPTS=-Xmx${BESU_XMX}${BESU_JVM_EXTRA}#" "$COMPOSE_FILE"
+log "Heap da JVM ajustado para -Xmx$BESU_XMX (RAM detectada: ${RAM_GB}GB, Node-$NODE_INDEX)"
+
+# Orçamento de tempo pra seleção de transações num bloco QBFT — só Node-1.
+# Default (não setado explicitamente) é calculado pelo Besu como fração do
+# blockperiodseconds=1 (~750ms). Sob carga da varredura distribuída, blocos
+# passaram a sair com 0 tx assim que esse orçamento estourou (WARN
+# "BlockTransactionSelector ... exceeds the maximum configured duration of
+# 750ms"), e nunca mais incluíram nada — travamento permanente, não degradação
+# gradual. Isso é mitigação de baixo risco (mais tempo de busca por bloco,
+# ainda bem abaixo do requesttimeoutseconds=10 do QBFT); não é garantia de
+# correção caso a causa real seja uma pausa de GC/stall de I/O que impeça a
+# thread de rodar de todo — por isso o log de GC acima, pra diferenciar.
+if [ "$NODE_INDEX" = "1" ]; then
+  sed -i "/--tx-pool-max-future-by-sender=5000/a\\      --poa-block-txs-selection-max-time=4000" "$COMPOSE_FILE"
+  log "poa-block-txs-selection-max-time ajustado para 4000ms no Node-1 (default calculado ~750ms insuficiente sob carga alta)"
+fi
 
 # Verifica que o compose file correto existe
 if [ ! -f "$COMPOSE_FILE" ]; then

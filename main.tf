@@ -1,9 +1,9 @@
 terraform {
   required_version = ">= 1.3.0"
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.0"
     }
     null = {
       source  = "hashicorp/null"
@@ -12,210 +12,202 @@ terraform {
   }
 }
 
-provider "aws" {
-  region = var.aws_region
+provider "azurerm" {
+  features {}
 }
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"]
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
-  }
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
-data "aws_caller_identity" "current" {}
+data "azurerm_client_config" "current" {}
 
 # ============================================================================
-# VPC dedicada com subnet pública e IPs privados fixos para os nós
+# Resource group + rede — VNet dedicada com subnet única e IPs privados fixos
+# para os nós (mesma topologia lógica da versão AWS: uma rede isolada, uma
+# subnet, um NSG compartilhado por todas as instâncias).
 # ============================================================================
 
-resource "aws_vpc" "besu" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-  tags                 = { Name = "${var.project_name}-vpc" }
+resource "azurerm_resource_group" "besu" {
+  name     = "${var.project_name}-rg"
+  location = var.azure_location
 }
 
-resource "aws_subnet" "besu" {
-  vpc_id                  = aws_vpc.besu.id
-  cidr_block              = var.node_subnet_cidr
-  availability_zone       = var.aws_az
-  map_public_ip_on_launch = true
-  tags                    = { Name = "${var.project_name}-subnet" }
+resource "azurerm_virtual_network" "besu" {
+  name                = "${var.project_name}-vnet"
+  address_space       = ["10.0.0.0/16"]
+  location            = azurerm_resource_group.besu.location
+  resource_group_name = azurerm_resource_group.besu.name
 }
 
-resource "aws_internet_gateway" "besu" {
-  vpc_id = aws_vpc.besu.id
-  tags   = { Name = "${var.project_name}-igw" }
-}
-
-resource "aws_route_table" "besu" {
-  vpc_id = aws_vpc.besu.id
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.besu.id
-  }
-  tags = { Name = "${var.project_name}-rt" }
-}
-
-resource "aws_route_table_association" "besu" {
-  subnet_id      = aws_subnet.besu.id
-  route_table_id = aws_route_table.besu.id
+resource "azurerm_subnet" "besu" {
+  name                 = "${var.project_name}-subnet"
+  resource_group_name  = azurerm_resource_group.besu.name
+  virtual_network_name = azurerm_virtual_network.besu.name
+  address_prefixes     = [var.node_subnet_cidr]
 }
 
 # ============================================================================
-# Security Group — mesmo SG para todos os nós; P2P liberado apenas entre eles
+# Security Group — mesmo NSG para todos os nós; P2P/MQTT liberados apenas
+# entre eles. Sem equivalente a "self=true" no Azure: como só há uma subnet e
+# ela é usada exclusivamente por esta rede, usar o CIDR da subnet como origem
+# dá o mesmo resultado.
 # ============================================================================
 
-resource "aws_security_group" "besu_nodes" {
-  name        = "${var.project_name}-nodes-sg"
-  description = "Security group for distributed Besu nodes"
-  vpc_id      = aws_vpc.besu.id
+resource "azurerm_network_security_group" "besu_nodes" {
+  name                = "${var.project_name}-nodes-nsg"
+  location            = azurerm_resource_group.besu.location
+  resource_group_name = azurerm_resource_group.besu.name
+}
 
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_ssh_cidr]
-  }
+resource "azurerm_network_security_rule" "ssh" {
+  name                        = "SSH"
+  priority                    = 100
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "22"
+  source_address_prefix       = var.allowed_ssh_cidr
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.besu.name
+  network_security_group_name = azurerm_network_security_group.besu_nodes.name
+}
 
-  # RPC HTTP: 8545 (bootnode.yaml) e 8546 (validator.yaml) — mesmas portas em todos os EC2
-  ingress {
-    description = "RPC HTTP"
-    from_port   = 8545
-    to_port     = 8546
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+# RPC HTTP: 8545 (bootnode.yaml) e 8546 (validator.yaml) — mesmas portas em todas as VMs
+resource "azurerm_network_security_rule" "rpc_http" {
+  name                        = "RPC-HTTP"
+  priority                    = 110
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "8545-8546"
+  source_address_prefix       = "*"
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.besu.name
+  network_security_group_name = azurerm_network_security_group.besu_nodes.name
+}
 
-  # WebSocket: 8645 (bootnode.yaml) e 8646 (validator.yaml)
-  ingress {
-    description = "WebSocket"
-    from_port   = 8645
-    to_port     = 8646
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+# WebSocket: 8645 (bootnode.yaml) e 8646 (validator.yaml)
+resource "azurerm_network_security_rule" "websocket" {
+  name                        = "WebSocket"
+  priority                    = 120
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "8645-8646"
+  source_address_prefix       = "*"
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.besu.name
+  network_security_group_name = azurerm_network_security_group.besu_nodes.name
+}
 
-  # P2P apenas entre instâncias do mesmo SG (tráfego intra-nós via VPC).
-  # Range 30303-30302+N cobre as portas de cada nó (Node-i usa porta 30302+i).
-  ingress {
-    description = "P2P TCP entre nos"
-    from_port   = 30303
-    to_port     = 30302 + var.node_count
-    protocol    = "tcp"
-    self        = true
-  }
+# P2P apenas entre instâncias desta rede (tráfego intra-nós via VNet).
+# Range 30303-30302+N cobre as portas de cada nó (Node-i usa porta 30302+i).
+resource "azurerm_network_security_rule" "p2p_tcp" {
+  name                        = "P2P-TCP-entre-nos"
+  priority                    = 130
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "30303-${30302 + var.node_count}"
+  source_address_prefix       = var.node_subnet_cidr
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.besu.name
+  network_security_group_name = azurerm_network_security_group.besu_nodes.name
+}
 
-  ingress {
-    description = "P2P UDP entre nos"
-    from_port   = 30303
-    to_port     = 30302 + var.node_count
-    protocol    = "udp"
-    self        = true
-  }
+resource "azurerm_network_security_rule" "p2p_udp" {
+  name                        = "P2P-UDP-entre-nos"
+  priority                    = 140
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Udp"
+  source_port_range           = "*"
+  destination_port_range      = "30303-${30302 + var.node_count}"
+  source_address_prefix       = var.node_subnet_cidr
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.besu.name
+  network_security_group_name = azurerm_network_security_group.besu_nodes.name
+}
 
-  ingress {
-    description = "Prometheus metrics"
-    from_port   = 9545
-    to_port     = 9546
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+resource "azurerm_network_security_rule" "prometheus" {
+  name                        = "Prometheus-metrics"
+  priority                    = 150
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "9545-9546"
+  source_address_prefix       = "*"
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.besu.name
+  network_security_group_name = azurerm_network_security_group.besu_nodes.name
+}
 
-  # MQTT — broker do modo distribuído do Caliper (manager na instância A, workers remotos na B).
-  # Restrito a instâncias do mesmo SG, não precisa expor pra fora da VPC.
-  ingress {
-    description = "MQTT (Caliper worker distribuido)"
-    from_port   = 1883
-    to_port     = 1883
-    protocol    = "tcp"
-    self        = true
-  }
+# MQTT — broker do modo distribuído do Caliper (manager na instância A, workers remotos na B).
+# Restrito às instâncias desta rede, não precisa expor pra fora da VNet.
+resource "azurerm_network_security_rule" "mqtt" {
+  name                        = "MQTT-Caliper-distribuido"
+  priority                    = 160
+  direction                   = "Inbound"
+  access                      = "Allow"
+  protocol                    = "Tcp"
+  source_port_range           = "*"
+  destination_port_range      = "1883"
+  source_address_prefix       = var.node_subnet_cidr
+  destination_address_prefix  = "*"
+  resource_group_name         = azurerm_resource_group.besu.name
+  network_security_group_name = azurerm_network_security_group.besu_nodes.name
+}
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = { Name = "${var.project_name}-nodes-sg" }
+resource "azurerm_subnet_network_security_group_association" "besu" {
+  subnet_id                 = azurerm_subnet.besu.id
+  network_security_group_id = azurerm_network_security_group.besu_nodes.id
 }
 
 # ============================================================================
-# Key Pair SSH
+# Storage — conta + container para distribuição de chaves e resultados entre os nós
 # ============================================================================
 
-resource "aws_key_pair" "besu" {
-  key_name   = "${var.project_name}-key"
-  public_key = file(var.public_key_path)
+# Nome de storage account não aceita hífen e precisa ser globalmente único —
+# transformação determinística do project_name + sufixo curto da subscription,
+# sem depender do provider "random".
+resource "azurerm_storage_account" "besu_data" {
+  name                            = "${lower(replace(var.project_name, "-", ""))}${substr(sha1(data.azurerm_client_config.current.subscription_id), 0, 8)}"
+  resource_group_name             = azurerm_resource_group.besu.name
+  location                        = azurerm_resource_group.besu.location
+  account_tier                    = "Standard"
+  account_replication_type        = "LRS"
+  allow_nested_items_to_be_public = false
+}
+
+resource "azurerm_storage_container" "besu_data" {
+  name                  = "${var.project_name}-data"
+  storage_account_id    = azurerm_storage_account.besu_data.id
+  container_access_type = "private"
 }
 
 # ============================================================================
-# S3 — bucket para distribuição de chaves entre os nós
+# Identidade gerenciada — usada por todas as VMs (nós Besu + Caliper A/B) para
+# acessar o Storage sem credenciais explícitas (via "azcopy login --identity").
+# Uma identidade só, compartilhada, já que todos os papéis precisam das mesmas
+# permissões no mesmo container.
 # ============================================================================
 
-resource "aws_s3_bucket" "besu_data" {
-  bucket        = "${var.project_name}-data-${data.aws_caller_identity.current.account_id}"
-  force_destroy = true
-  tags          = { Name = "${var.project_name}-data" }
+resource "azurerm_user_assigned_identity" "besu_data" {
+  name                = "${var.project_name}-data-identity"
+  resource_group_name = azurerm_resource_group.besu.name
+  location            = azurerm_resource_group.besu.location
 }
 
-resource "aws_s3_bucket_public_access_block" "besu_data" {
-  bucket                  = aws_s3_bucket.besu_data.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# ============================================================================
-# IAM — instance profile para os nós acessarem o S3
-# ============================================================================
-
-resource "aws_iam_role" "besu_node" {
-  name = "${var.project_name}-node-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy" "besu_node_s3" {
-  name = "${var.project_name}-node-s3-policy"
-  role = aws_iam_role.besu_node.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = ["s3:PutObject", "s3:GetObject", "s3:ListBucket"]
-      Resource = [
-        aws_s3_bucket.besu_data.arn,
-        "${aws_s3_bucket.besu_data.arn}/*"
-      ]
-    }]
-  })
-}
-
-resource "aws_iam_instance_profile" "besu_node" {
-  name = "${var.project_name}-node-profile"
-  role = aws_iam_role.besu_node.name
+resource "azurerm_role_assignment" "besu_data_blob_contributor" {
+  scope                = azurerm_storage_account.besu_data.id
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = azurerm_user_assigned_identity.besu_data.principal_id
 }
 
 # ============================================================================
-# EC2 — var.node_count instâncias com IPs privados fixos
+# VMs — var.node_count instâncias com IPs privados fixos
 #   index 0 → Node-1 (bootnode)  → 10.0.1.10
 #   index 1 → Node-2 (validator) → 10.0.1.11
 #   index 2 → Node-3 (bootnode)  → 10.0.1.12
@@ -225,6 +217,10 @@ resource "aws_iam_instance_profile" "besu_node" {
 # ============================================================================
 
 locals {
+  # Usuário SSH fixo — todo script assume "ubuntu@"/"/home/ubuntu/..." como
+  # constante; não expor como variável.
+  admin_username = "ubuntu"
+
   # Node-1 (index 0) e Node-3 (index 2) são bootnodes; demais são validators
   node_roles = [
     for i in range(var.node_count) :
@@ -238,27 +234,72 @@ locals {
   peers_expected_hex = format("0x%x", var.node_count - 1)
 }
 
-resource "aws_instance" "besu_node" {
-  count = var.node_count
+# Toda instância recebe IP público Standard+Static (o Azure não tem "IP
+# público efêmero automático" — cada um precisa de um azurerm_public_ip
+# próprio; Standard SKU exige alocação Static de qualquer forma).
+resource "azurerm_public_ip" "besu_node" {
+  count               = var.node_count
+  name                = "${var.project_name}-node-${count.index + 1}-pip"
+  resource_group_name = azurerm_resource_group.besu.name
+  location            = azurerm_resource_group.besu.location
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  zones               = var.azure_availability_zone == null ? null : [var.azure_availability_zone]
+}
 
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = count.index == 0 ? var.instance_type_node1 : var.instance_type_besu
-  subnet_id                   = aws_subnet.besu.id
-  vpc_security_group_ids      = [aws_security_group.besu_nodes.id]
-  key_name                    = aws_key_pair.besu.key_name
-  associate_public_ip_address = true
-  iam_instance_profile        = aws_iam_instance_profile.besu_node.name
-  private_ip                  = "10.0.1.${10 + count.index}"
+resource "azurerm_network_interface" "besu_node" {
+  count               = var.node_count
+  name                = "${var.project_name}-node-${count.index + 1}-nic"
+  resource_group_name = azurerm_resource_group.besu.name
+  location            = azurerm_resource_group.besu.location
 
-  root_block_device {
-    volume_type = "gp3"
-    volume_size = 50
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.besu.id
+    private_ip_address_allocation = "Static"
+    private_ip_address            = "10.0.1.${10 + count.index}"
+    public_ip_address_id          = azurerm_public_ip.besu_node[count.index].id
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "besu_node" {
+  count               = var.node_count
+  name                = "${var.project_name}-node-${count.index + 1}"
+  resource_group_name = azurerm_resource_group.besu.name
+  location            = azurerm_resource_group.besu.location
+  size                = count.index == 0 ? var.vm_size_node1 : var.vm_size_besu
+  admin_username      = local.admin_username
+  zone                = var.azure_availability_zone
+  network_interface_ids = [
+    azurerm_network_interface.besu_node[count.index].id,
+  ]
+
+  admin_ssh_key {
+    username   = local.admin_username
+    public_key = file(var.public_key_path)
   }
 
-  user_data = templatefile("${path.module}/scripts/node_user_data.sh", {
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 50
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts-gen2"
+    version   = "latest"
+  }
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.besu_data.id]
+  }
+
+  custom_data = base64encode(templatefile("${path.module}/scripts/node_user_data.sh", {
     node_index = count.index + 1
-    aws_region = var.aws_region
-  })
+  }))
 
   tags = {
     Name      = "${var.project_name}-node-${count.index + 1}"
@@ -268,24 +309,17 @@ resource "aws_instance" "besu_node" {
   }
 }
 
-# EIP apenas no Node-1 — é o bootnode e o ponto de acesso externo
-resource "aws_eip" "node1" {
-  instance   = aws_instance.besu_node[0].id
-  domain     = "vpc"
-  depends_on = [aws_internet_gateway.besu]
-}
-
 # ============================================================================
 # null_resource: cadeia de setup distribuído
 # ============================================================================
 
 # 1. Aguarda SSH disponível nos N nós antes de prosseguir
 resource "null_resource" "wait_ssh_all_nodes" {
-  depends_on = [aws_eip.node1, aws_instance.besu_node]
+  depends_on = [azurerm_public_ip.besu_node, azurerm_linux_virtual_machine.besu_node]
 
   provisioner "local-exec" {
     command = <<-EOT
-      SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes -i ${var.private_key_path}"
+      SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -i ${var.private_key_path}"
 
       wait_node() {
         local label=$1 host=$2 ssh_ok=0
@@ -322,15 +356,15 @@ resource "null_resource" "wait_ssh_all_nodes" {
         exit 1
       }
 
-      wait_node "Node-1" "${aws_eip.node1.public_ip}"
+      wait_node "Node-1" "${azurerm_public_ip.besu_node[0].ip_address}"
       %{~for i in range(1, var.node_count)~}
-      wait_node "Node-${i + 1}" "${aws_instance.besu_node[i].public_ip}"
+      wait_node "Node-${i + 1}" "${azurerm_public_ip.besu_node[i].ip_address}"
       %{~endfor~}
     EOT
   }
 }
 
-# 2. Gera chaves no Node-1 e distribui para o S3
+# 2. Gera chaves no Node-1 e distribui para o Blob Storage
 resource "null_resource" "generate_and_distribute_keys" {
   depends_on = [null_resource.wait_ssh_all_nodes]
 
@@ -338,7 +372,7 @@ resource "null_resource" "generate_and_distribute_keys" {
     type        = "ssh"
     user        = "ubuntu"
     private_key = file(var.private_key_path)
-    host        = aws_eip.node1.public_ip
+    host        = azurerm_public_ip.besu_node[0].ip_address
     agent       = false
   }
 
@@ -353,7 +387,7 @@ resource "null_resource" "generate_and_distribute_keys" {
       # Contas de worker do Caliper a permissionar (accounts-allowlist) — cobre o
       # total real de workers do modo distribuído (manager + extras), com piso de
       # 32 preservando o comportamento de sempre pro modo single-instance/pequeno.
-      "NODE_COUNT=${var.node_count} S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} TOTAL_CALIPER_WORKERS=${max(32, var.caliper_a_workers + (var.node_caliper_count > 1 ? (var.node_caliper_count - 1) * var.caliper_b_workers : 0))} bash /tmp/generate_and_distribute_keys.sh",
+      "NODE_COUNT=${var.node_count} AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} TOTAL_CALIPER_WORKERS=${max(32, var.caliper_a_workers + (var.node_caliper_count > 1 ? (var.node_caliper_count - 1) * var.caliper_b_workers : 0))} bash /tmp/generate_and_distribute_keys.sh",
     ]
   }
 }
@@ -366,7 +400,7 @@ resource "null_resource" "start_node1" {
     type        = "ssh"
     user        = "ubuntu"
     private_key = file(var.private_key_path)
-    host        = aws_eip.node1.public_ip
+    host        = azurerm_public_ip.besu_node[0].ip_address
     agent       = false
   }
 
@@ -378,7 +412,7 @@ resource "null_resource" "start_node1" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/start_besu_node.sh",
-      "NODE_INDEX=1 S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+      "NODE_INDEX=1 AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} bash /tmp/start_besu_node.sh",
     ]
   }
 }
@@ -391,7 +425,7 @@ resource "null_resource" "start_node3" {
     type        = "ssh"
     user        = "ubuntu"
     private_key = file(var.private_key_path)
-    host        = aws_instance.besu_node[2].public_ip
+    host        = azurerm_public_ip.besu_node[2].ip_address
     agent       = false
   }
 
@@ -403,7 +437,7 @@ resource "null_resource" "start_node3" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/start_besu_node.sh",
-      "NODE_INDEX=3 S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+      "NODE_INDEX=3 AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} bash /tmp/start_besu_node.sh",
     ]
   }
 }
@@ -417,7 +451,7 @@ resource "null_resource" "start_validators" {
     type        = "ssh"
     user        = "ubuntu"
     private_key = file(var.private_key_path)
-    host        = aws_instance.besu_node[local.validator_indices[count.index]].public_ip
+    host        = azurerm_public_ip.besu_node[local.validator_indices[count.index]].ip_address
     agent       = false
   }
 
@@ -429,7 +463,7 @@ resource "null_resource" "start_validators" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/start_besu_node.sh",
-      "NODE_INDEX=${local.validator_indices[count.index] + 1} S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/start_besu_node.sh",
+      "NODE_INDEX=${local.validator_indices[count.index] + 1} AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} bash /tmp/start_besu_node.sh",
     ]
   }
 }
@@ -449,7 +483,7 @@ resource "null_resource" "wait_network_ready" {
         sleep 15
         RESULT=$(curl -s --max-time 5 -X POST \
           --data '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
-          http://${aws_eip.node1.public_ip}:8545 2>/dev/null || true)
+          http://${azurerm_public_ip.besu_node[0].ip_address}:8545 2>/dev/null || true)
         PEERS=$(echo "$RESULT" | grep -o '"result":"0x[^"]*"' | grep -o '0x[0-9a-f]*' || true)
         if [ -n "$PEERS" ] && [ "$PEERS" = "${local.peers_expected_hex}" ]; then
           echo "Rede com ${var.node_count} peers após $((i * 15))s — peerCount: $PEERS"
@@ -471,7 +505,7 @@ resource "null_resource" "deploy_contracts" {
     type        = "ssh"
     user        = "ubuntu"
     private_key = file(var.private_key_path)
-    host        = aws_eip.node1.public_ip
+    host        = azurerm_public_ip.besu_node[0].ip_address
     agent       = false
   }
 
@@ -483,7 +517,7 @@ resource "null_resource" "deploy_contracts" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/deploy_contracts.sh",
-      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} bash /tmp/deploy_contracts.sh",
+      "AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} bash /tmp/deploy_contracts.sh",
     ]
   }
 }
@@ -492,61 +526,66 @@ resource "null_resource" "deploy_contracts" {
 # Etapa 3 — Testes com Caliper em instância dedicada
 # ============================================================================
 
-# IAM role dedicada para a instância Caliper
-# Leitura e escrita no mesmo bucket besu-keys — prefixo caliper-results/ para os CSVs
-resource "aws_iam_role" "caliper" {
-  name = "${var.project_name}-caliper-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+# VM dedicada para o Caliper — mesma VNet, acessa Node-1 via IP privado.
+# IP 10.0.1.30 fica fora do range dos nós (máximo Node-14 = 10.0.1.23).
+resource "azurerm_public_ip" "caliper" {
+  name                = "${var.project_name}-caliper-pip"
+  resource_group_name = azurerm_resource_group.besu.name
+  location            = azurerm_resource_group.besu.location
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  zones               = var.azure_availability_zone == null ? null : [var.azure_availability_zone]
 }
 
-resource "aws_iam_role_policy" "caliper_s3" {
-  name = "${var.project_name}-caliper-s3-policy"
-  role = aws_iam_role.caliper.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
-      Resource = [
-        aws_s3_bucket.besu_data.arn,
-        "${aws_s3_bucket.besu_data.arn}/*"
-      ]
-    }]
-  })
+resource "azurerm_network_interface" "caliper" {
+  name                = "${var.project_name}-caliper-nic"
+  resource_group_name = azurerm_resource_group.besu.name
+  location            = azurerm_resource_group.besu.location
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.besu.id
+    private_ip_address_allocation = "Static"
+    private_ip_address            = "10.0.1.30"
+    public_ip_address_id          = azurerm_public_ip.caliper.id
+  }
 }
 
-resource "aws_iam_instance_profile" "caliper" {
-  name = "${var.project_name}-caliper-profile"
-  role = aws_iam_role.caliper.name
-}
+resource "azurerm_linux_virtual_machine" "caliper" {
+  name                  = "${var.project_name}-caliper"
+  resource_group_name   = azurerm_resource_group.besu.name
+  location              = azurerm_resource_group.besu.location
+  size                  = var.vm_size_caliper
+  admin_username        = local.admin_username
+  zone                  = var.azure_availability_zone
+  network_interface_ids = [azurerm_network_interface.caliper.id]
 
-# EC2 dedicada para o Caliper — mesma VPC, acessa Node-1 via IP privado
-# IP 10.0.1.30 fica fora do range dos nós (máximo Node-14 = 10.0.1.23)
-resource "aws_instance" "caliper" {
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type_caliper
-  subnet_id                   = aws_subnet.besu.id
-  vpc_security_group_ids      = [aws_security_group.besu_nodes.id]
-  key_name                    = aws_key_pair.besu.key_name
-  associate_public_ip_address = true
-  iam_instance_profile        = aws_iam_instance_profile.caliper.name
-  private_ip                  = "10.0.1.30"
-
-  root_block_device {
-    volume_type = "gp3"
+  admin_ssh_key {
+    username   = local.admin_username
+    public_key = file(var.public_key_path)
   }
 
-  user_data = templatefile("${path.module}/scripts/node_user_data.sh", {
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 30
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts-gen2"
+    version   = "latest"
+  }
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.besu_data.id]
+  }
+
+  custom_data = base64encode(templatefile("${path.module}/scripts/node_user_data.sh", {
     node_index = "caliper"
-    aws_region = var.aws_region
-  })
+  }))
 
   tags = {
     Name    = "${var.project_name}-caliper"
@@ -557,12 +596,12 @@ resource "aws_instance" "caliper" {
 
 # 6. Aguarda SSH + user_data na instância Caliper (em paralelo com o setup do Besu)
 resource "null_resource" "wait_ssh_caliper" {
-  depends_on = [aws_instance.caliper]
+  depends_on = [azurerm_linux_virtual_machine.caliper]
 
   provisioner "local-exec" {
     command = <<-EOT
-      SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes -i ${var.private_key_path}"
-      HOST="${aws_instance.caliper.public_ip}"
+      SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -i ${var.private_key_path}"
+      HOST="${azurerm_public_ip.caliper.ip_address}"
 
       echo "Aguardando SSH na instância Caliper ($HOST)..."
       ssh_ok=0
@@ -608,7 +647,7 @@ resource "null_resource" "run_caliper_tests" {
     type        = "ssh"
     user        = "ubuntu"
     private_key = file(var.private_key_path)
-    host        = aws_instance.caliper.public_ip
+    host        = azurerm_public_ip.caliper.ip_address
     agent       = false
   }
 
@@ -628,7 +667,7 @@ resource "null_resource" "run_caliper_tests" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/run_caliper_tests.sh /tmp/extract_and_upload_results.sh",
-      "NODE_COUNT=${var.node_count} S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} NODE1_PRIVATE_IP=10.0.1.10 SKIP_SWEEP=${var.node_caliper_count > 1 ? "true" : "false"} bash /tmp/run_caliper_tests.sh",
+      "NODE_COUNT=${var.node_count} AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} NODE1_PRIVATE_IP=10.0.1.10 SKIP_SWEEP=${var.node_caliper_count > 1 ? "true" : "false"} bash /tmp/run_caliper_tests.sh",
     ]
   }
 }
@@ -641,62 +680,73 @@ resource "null_resource" "run_caliper_tests" {
 # sincronização de round e relatório combinado nativos do Caliper, sem precisar de
 # barreira feita à mão nem de somar relatórios separados. Desligado por padrão
 # (node_caliper_count=1). Varredura completa orquestrada do laptop do operador via
-# scripts/run_distributed_sweep.py — ver plano "node_caliper_count + varredura
-# distribuída automática (N instâncias)".
+# scripts/run_distributed_sweep.py, que também envia (via scp) e dá chmod +x no
+# run_caliper_manager_distributed.sh e no remote_patch_yaml.py na instância A antes
+# de rodar o primeiro round — não precisa de null_resource dedicado pra isso.
 
-# 8. Deixa pronto na instância A (manager) o script pra rodar cada round distribuído
-#    e o patcher de YAML usado pelo orquestrador local — só upload, não dispara nada
-#    automaticamente.
-resource "null_resource" "upload_caliper_manager_script" {
-  count      = var.node_caliper_count > 1 ? 1 : 0
-  depends_on = [null_resource.run_caliper_tests]
+# VMs dedicadas às instâncias Caliper extras — só workers remotos, sem
+# manager/Prometheus. IPs 10.0.1.31, 10.0.1.32, ..., logo após o 10.0.1.30 da A.
+resource "azurerm_public_ip" "caliper_b" {
+  count               = var.node_caliper_count > 1 ? var.node_caliper_count - 1 : 0
+  name                = "${var.project_name}-caliper-b-${count.index + 1}-pip"
+  resource_group_name = azurerm_resource_group.besu.name
+  location            = azurerm_resource_group.besu.location
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  zones               = var.azure_availability_zone == null ? null : [var.azure_availability_zone]
+}
 
-  connection {
-    type        = "ssh"
-    user        = "ubuntu"
-    private_key = file(var.private_key_path)
-    host        = aws_instance.caliper.public_ip
-    agent       = false
-  }
+resource "azurerm_network_interface" "caliper_b" {
+  count               = var.node_caliper_count > 1 ? var.node_caliper_count - 1 : 0
+  name                = "${var.project_name}-caliper-b-${count.index + 1}-nic"
+  resource_group_name = azurerm_resource_group.besu.name
+  location            = azurerm_resource_group.besu.location
 
-  provisioner "file" {
-    source      = "${path.module}/scripts/run_caliper_manager_distributed.sh"
-    destination = "/home/ubuntu/tests-with-caliper/evaluation-contracts-indy-besu/run_caliper_manager_distributed.sh"
-  }
-
-  provisioner "file" {
-    source      = "${path.module}/scripts/remote_patch_yaml.py"
-    destination = "/home/ubuntu/tests-with-caliper/evaluation-contracts-indy-besu/remote_patch_yaml.py"
-  }
-
-  provisioner "remote-exec" {
-    inline = [
-      "chmod +x /home/ubuntu/tests-with-caliper/evaluation-contracts-indy-besu/run_caliper_manager_distributed.sh",
-    ]
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.besu.id
+    private_ip_address_allocation = "Static"
+    private_ip_address            = "10.0.1.${31 + count.index}"
+    public_ip_address_id          = azurerm_public_ip.caliper_b[count.index].id
   }
 }
 
-# EC2s dedicadas às instâncias Caliper extras — só workers remotos, sem
-# manager/Prometheus. IPs 10.0.1.31, 10.0.1.32, ..., logo após o 10.0.1.30 da A.
-resource "aws_instance" "caliper_b" {
-  count                       = var.node_caliper_count > 1 ? var.node_caliper_count - 1 : 0
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type_caliper_b
-  subnet_id                   = aws_subnet.besu.id
-  vpc_security_group_ids      = [aws_security_group.besu_nodes.id]
-  key_name                    = aws_key_pair.besu.key_name
-  associate_public_ip_address = true
-  iam_instance_profile        = aws_iam_instance_profile.caliper.name
-  private_ip                  = "10.0.1.${31 + count.index}"
+resource "azurerm_linux_virtual_machine" "caliper_b" {
+  count                 = var.node_caliper_count > 1 ? var.node_caliper_count - 1 : 0
+  name                  = "${var.project_name}-caliper-b-${count.index + 1}"
+  resource_group_name   = azurerm_resource_group.besu.name
+  location              = azurerm_resource_group.besu.location
+  size                  = var.vm_size_caliper_b
+  admin_username        = local.admin_username
+  zone                  = var.azure_availability_zone
+  network_interface_ids = [azurerm_network_interface.caliper_b[count.index].id]
 
-  root_block_device {
-    volume_type = "gp3"
+  admin_ssh_key {
+    username   = local.admin_username
+    public_key = file(var.public_key_path)
   }
 
-  user_data = templatefile("${path.module}/scripts/node_user_data.sh", {
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "StandardSSD_LRS"
+    disk_size_gb         = 30
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts-gen2"
+    version   = "latest"
+  }
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [azurerm_user_assigned_identity.besu_data.id]
+  }
+
+  custom_data = base64encode(templatefile("${path.module}/scripts/node_user_data.sh", {
     node_index = "caliper-b-${count.index + 1}"
-    aws_region = var.aws_region
-  })
+  }))
 
   tags = {
     Name    = "${var.project_name}-caliper-b-${count.index + 1}"
@@ -705,15 +755,15 @@ resource "aws_instance" "caliper_b" {
   }
 }
 
-# 9. Aguarda SSH + user_data em cada instância Caliper extra
+# 8. Aguarda SSH + user_data em cada instância Caliper extra
 resource "null_resource" "wait_ssh_caliper_b" {
   count      = var.node_caliper_count > 1 ? var.node_caliper_count - 1 : 0
-  depends_on = [aws_instance.caliper_b]
+  depends_on = [azurerm_linux_virtual_machine.caliper_b]
 
   provisioner "local-exec" {
     command = <<-EOT
-      SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes -i ${var.private_key_path}"
-      HOST="${aws_instance.caliper_b[count.index].public_ip}"
+      SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -i ${var.private_key_path}"
+      HOST="${azurerm_public_ip.caliper_b[count.index].ip_address}"
 
       echo "Aguardando SSH na instância Caliper B-${count.index + 1} ($HOST)..."
       ssh_ok=0
@@ -751,7 +801,8 @@ resource "null_resource" "wait_ssh_caliper_b" {
   }
 }
 
-# 10. Setup de cada instância Caliper extra — clona o repo, instala o Caliper CLI,
+# 9. Setup de cada instância Caliper extra — mesmo script da instância A
+#     (run_caliper_tests.sh), com ROLE=worker: clona o repo, instala o Caliper CLI,
 #     patcha o networkconfig.json (sempre mirando o Node-1) e deixa pronto o
 #     launch_workers.sh (não dispara os workers automaticamente — isso é feito pelo
 #     orquestrador local, run_distributed_sweep.py).
@@ -763,46 +814,49 @@ resource "null_resource" "setup_caliper_b" {
     type        = "ssh"
     user        = "ubuntu"
     private_key = file(var.private_key_path)
-    host        = aws_instance.caliper_b[count.index].public_ip
+    host        = azurerm_public_ip.caliper_b[count.index].ip_address
     agent       = false
   }
 
   provisioner "file" {
-    source      = "${path.module}/scripts/setup_caliper_worker_remote.sh"
-    destination = "/tmp/setup_caliper_worker_remote.sh"
+    source      = "${path.module}/scripts/run_caliper_tests.sh"
+    destination = "/tmp/run_caliper_tests.sh"
   }
 
   provisioner "remote-exec" {
     inline = [
-      "chmod +x /tmp/setup_caliper_worker_remote.sh",
-      "S3_KEYS_BUCKET=${aws_s3_bucket.besu_data.bucket} AWS_REGION=${var.aws_region} NODE1_PRIVATE_IP=10.0.1.10 bash /tmp/setup_caliper_worker_remote.sh",
+      "chmod +x /tmp/run_caliper_tests.sh",
+      "ROLE=worker AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} NODE1_PRIVATE_IP=10.0.1.10 bash /tmp/run_caliper_tests.sh",
     ]
   }
 }
 
-# 11. Roda a varredura distribuída completa automaticamente, como último passo do
-#     apply — do laptop do operador (local-exec), nunca de dentro de uma instância
-#     EC2, então a chave privada nunca é copiada pra lá. Bloqueia o "terraform
-#     apply" até todos os rounds terminarem e os CSVs subirem pro S3 (mesmo
+# 10. Roda a varredura distribuída completa automaticamente, como último passo do
+#     apply — do laptop do operador (local-exec), nunca de dentro de uma VM, então
+#     a chave privada nunca é copiada pra lá. Bloqueia o "terraform apply" até
+#     todos os rounds terminarem e os CSVs subirem pro Blob Storage (mesmo
 #     comportamento que o caminho single-instance já tem hoje com run_test_local.py).
 #     Os valores são passados direto por flag (não via "terraform output"), porque
 #     rodar "terraform output" a partir de um local-exec do MESMO apply em
 #     andamento travaria no lock do state que o processo pai já está segurando.
+#     O próprio script envia (scp) e dá chmod +x no run_caliper_manager_distributed.sh
+#     e no remote_patch_yaml.py na instância A antes do primeiro round.
 resource "null_resource" "run_distributed_sweep" {
   count      = var.node_caliper_count > 1 ? 1 : 0
-  depends_on = [null_resource.upload_caliper_manager_script, null_resource.setup_caliper_b]
+  depends_on = [null_resource.run_caliper_tests, null_resource.setup_caliper_b]
 
   provisioner "local-exec" {
     command = <<-EOT
       python3 ${path.module}/scripts/run_distributed_sweep.py \
-        --instance-a-host ${aws_instance.caliper.public_ip} \
-        --instance-a-private-ip ${aws_instance.caliper.private_ip} \
-        --extra-hosts ${join(" ", aws_instance.caliper_b[*].public_ip)} \
+        --instance-a-host ${azurerm_public_ip.caliper.ip_address} \
+        --instance-a-private-ip ${azurerm_network_interface.caliper.ip_configuration[0].private_ip_address} \
+        --extra-hosts ${join(" ", azurerm_public_ip.caliper_b[*].ip_address)} \
         --caliper-a-workers ${var.caliper_a_workers} \
         --caliper-b-workers ${var.caliper_b_workers} \
-        --s3-bucket ${aws_s3_bucket.besu_data.bucket} \
-        --aws-region ${var.aws_region} \
-        --rpc-url http://${aws_eip.node1.public_ip}:8545 \
+        --storage-account ${azurerm_storage_account.besu_data.name} \
+        --storage-container ${azurerm_storage_container.besu_data.name} \
+        --identity-client-id ${azurerm_user_assigned_identity.besu_data.client_id} \
+        --rpc-url http://${azurerm_public_ip.besu_node[0].ip_address}:8545 \
         --private-key-path ${var.private_key_path}
     EOT
   }

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Roda na instância Caliper via remote-exec.
-# Baixa artefatos do S3, configura e executa os testes Caliper contra o Node-1.
+# Roda via remote-exec tanto na instância Caliper A/manager (ROLE=manager, padrão)
+# quanto nas instâncias Caliper B/worker (ROLE=worker) — os dois papéis fazem o
+# mesmo setup (download de artefatos do Blob Storage, clone do repo, bind do
+# Caliper, patch do networkconfig.json) e só divergem no final: o manager sobe
+# Prometheus e roda a varredura local (ou setup_issuer.js, se SKIP_SWEEP=true);
+# o worker só deixa pronto o launch_workers.sh, chamado depois por
+# run_distributed_sweep.py (do laptop do operador).
 set -euo pipefail
 
 LOG_FILE="/home/ubuntu/besu-setup.log"
@@ -11,17 +16,28 @@ CALIPER_ROOT="$CLONE_ROOT/evaluation-contracts-indy-besu"
 DEPLOY_ARTIFACTS_DIR="/home/ubuntu/deploy-artifacts"
 KEY_DIR="/home/ubuntu/besu-keys"
 
-: "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
-: "${AWS_REGION:?AWS_REGION não definido}"
+ROLE="${ROLE:-manager}"
+if [ "$ROLE" != "manager" ] && [ "$ROLE" != "worker" ]; then
+  echo "ERRO: ROLE inválido '$ROLE' — use 'manager' ou 'worker'" >&2
+  exit 1
+fi
+
+: "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT não definido}"
+: "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER não definido}"
+: "${AZURE_IDENTITY_CLIENT_ID:?AZURE_IDENTITY_CLIENT_ID não definido}"
 : "${NODE1_PRIVATE_IP:?NODE1_PRIVATE_IP não definido}"
-: "${NODE_COUNT:?NODE_COUNT não definido}"
-# Se true, pula a varredura automática (run_test_local.py) e a extração/upload de CSVs —
-# usado quando essa instância vai rodar o teste distribuído (modo MQTT) em vez da
-# varredura de sempre. Setup (clone, bind, networkconfig.json, Prometheus) roda igual.
-SKIP_SWEEP="${SKIP_SWEEP:-false}"
+
+if [ "$ROLE" = "manager" ]; then
+  : "${NODE_COUNT:?NODE_COUNT não definido}"
+  # Se true, pula a varredura automática (run_test_local.py) e a extração/upload de CSVs —
+  # usado quando essa instância vai rodar o teste distribuído (modo MQTT) em vez da
+  # varredura de sempre. Setup (clone, bind, networkconfig.json, Prometheus) roda igual.
+  SKIP_SWEEP="${SKIP_SWEEP:-false}"
+fi
 
 NODE1_RPC="http://${NODE1_PRIVATE_IP}:8545"
 NODE1_WS="ws://${NODE1_PRIVATE_IP}:8645"
+BLOB_BASE="https://$AZURE_STORAGE_ACCOUNT.blob.core.windows.net/$AZURE_STORAGE_CONTAINER"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -32,17 +48,20 @@ check() {
   log "OK: $1"
 }
 
-log "===== INICIANDO ETAPA 3 — Testes com Caliper ====="
+log "===== INICIANDO ETAPA 3 — Testes com Caliper (ROLE=$ROLE) ====="
+
+azcopy login --identity --identity-client-id="$AZURE_IDENTITY_CLIENT_ID"
+check "Login no azcopy via managed identity"
 
 # ============================================================================
-# Passo 1 — Baixar artefatos do deploy do S3
+# Passo 1 — Baixar artefatos do deploy do Blob Storage
 # ============================================================================
-log "Baixando artefatos do deploy do S3..."
+log "Baixando artefatos do deploy do Blob Storage..."
 mkdir -p "$DEPLOY_ARTIFACTS_DIR" "$KEY_DIR"
 
-aws s3 cp "s3://$S3_KEYS_BUCKET/artifacts/network-info.json" \
-  "$DEPLOY_ARTIFACTS_DIR/network-info.json" --region "$AWS_REGION"
-check "Download de network-info.json do S3"
+azcopy copy "$BLOB_BASE/artifacts/network-info.json" \
+  "$DEPLOY_ARTIFACTS_DIR/network-info.json"
+check "Download de network-info.json do Blob Storage"
 
 CHAIN_ID=$(jq -r '.chainId' "$DEPLOY_ARTIFACTS_DIR/network-info.json")
 if [ -z "$CHAIN_ID" ] || [ "$CHAIN_ID" = "null" ]; then
@@ -51,20 +70,21 @@ if [ -z "$CHAIN_ID" ] || [ "$CHAIN_ID" = "null" ]; then
 fi
 log "chainId: $CHAIN_ID"
 
-aws s3 cp "s3://$S3_KEYS_BUCKET/artifacts/deployments/" \
-  "$DEPLOY_ARTIFACTS_DIR/deployments/" --recursive --region "$AWS_REGION"
-check "Download dos deployments do S3"
+# "/*" na origem evita aninhar "deployments/" de novo dentro do destino local
+azcopy copy "$BLOB_BASE/artifacts/deployments/*" \
+  "$DEPLOY_ARTIFACTS_DIR/deployments/" --recursive
+check "Download dos deployments do Blob Storage"
 
 # ============================================================================
-# Passo 1.5 — Baixar chave privada do Node-1 e permissions_config do S3
+# Passo 1.5 — Baixar chave privada do Node-1 e permissions_config do Blob Storage
 # ============================================================================
-aws s3 cp "s3://$S3_KEYS_BUCKET/node-1/key" "$KEY_DIR/key" --region "$AWS_REGION"
-check "Download da chave privada do Node-1 do S3"
+azcopy copy "$BLOB_BASE/node-1/key" "$KEY_DIR/key"
+check "Download da chave privada do Node-1 do Blob Storage"
 chmod 600 "$KEY_DIR/key"
 
-aws s3 cp "s3://$S3_KEYS_BUCKET/shared/permissions_config.toml" \
-  "$KEY_DIR/permissions_config.toml" --region "$AWS_REGION"
-check "Download do permissions_config.toml do S3"
+azcopy copy "$BLOB_BASE/shared/permissions_config.toml" \
+  "$KEY_DIR/permissions_config.toml"
+check "Download do permissions_config.toml do Blob Storage"
 
 # ============================================================================
 # Passo 2 — Verificar que a rede Besu está ativa (via IP privado do Node-1)
@@ -121,16 +141,18 @@ check "Clone do repositório tests-with-caliper"
   exit 1
 }
 
-# ============================================================================
-# Passo 5.5 — Patchar campo include do monitor Prometheus nas configs do Caliper
-# ============================================================================
-# Cada config YAML tem: include: ["^node1$", "^node2$", ..., "^node6$"]
-# Substitui pela lista correta para N nós. Padrões são ancorados (^...$) porque o
-# Caliper trata cada item de `include` como regex não ancorado internamente — sem
-# âncoras, "node1" também casaria com "node10", "node11" etc. para node_count >= 10.
-log "Patchando include do monitor Prometheus para $NODE_COUNT nós..."
-export CALIPER_ROOT
-python3 << 'PYEOF'
+if [ "$ROLE" = "manager" ]; then
+  # ============================================================================
+  # Passo 5.5 — Patchar campo include do monitor Prometheus nas configs do Caliper
+  # ============================================================================
+  # Cada config YAML tem: include: ["^node1$", "^node2$", ..., "^node6$"]
+  # Substitui pela lista correta para N nós. Padrões são ancorados (^...$) porque o
+  # Caliper trata cada item de `include` como regex não ancorado internamente — sem
+  # âncoras, "node1" também casaria com "node10", "node11" etc. para node_count >= 10.
+  # Só relevante pro manager: é ele quem sobe o Prometheus que consome esse include.
+  log "Patchando include do monitor Prometheus para $NODE_COUNT nós..."
+  export CALIPER_ROOT
+  python3 << 'PYEOF'
 import os, re, glob
 
 node_count = int(os.environ['NODE_COUNT'])
@@ -154,7 +176,8 @@ for path in glob.glob(bench_dir + '/**/*.yaml', recursive=True):
 
 print(f'{patched} arquivo(s) patchado(s) para {node_count} nós')
 PYEOF
-check "Patch do include do monitor Prometheus"
+  check "Patch do include do monitor Prometheus"
+fi
 
 # ============================================================================
 # Passo 6 — Instalar Caliper CLI v0.5.0
@@ -204,7 +227,7 @@ log "SchemaRegistry:               $SCHEMA_ADDR"
 log "RevocationRegistry:           $REVOCATION_ADDR"
 
 # ============================================================================
-# Passo 9 — Extrair fromAddress e chave privada (dos arquivos baixados do S3)
+# Passo 9 — Extrair fromAddress e chave privada (dos arquivos baixados do Blob Storage)
 # ============================================================================
 log "Extraindo fromAddress do permissions_config.toml..."
 FROM_ADDRESS=$(grep "accounts-allowlist" "$KEY_DIR/permissions_config.toml" | \
@@ -300,6 +323,44 @@ grep "$NODE1_PRIVATE_IP" "$NETWORK_CONFIG" >/dev/null || {
   log "AVISO: IP do Node-1 ($NODE1_PRIVATE_IP) não encontrado no networkconfig.json"
 }
 
+if [ "$ROLE" = "worker" ]; then
+  # ============================================================================
+  # Passo 11 (worker) — Deixar pronto o script pra lançar os workers remotos.
+  # Chamado depois por run_distributed_sweep.py (launch_remote_workers()), não
+  # disparado manualmente.
+  # ============================================================================
+  cat > "$CALIPER_ROOT/launch_workers.sh" <<'EOF'
+#!/usr/bin/env bash
+# Uso: ./launch_workers.sh <IP_PRIVADO_DO_MANAGER> [NUM_WORKERS] [BENCHMARK_FILE]
+set -euo pipefail
+MANAGER_IP="${1:?informe o IP privado da instância A (manager), ex.: 10.0.1.30}"
+NUM_WORKERS="${2:-16}"
+BENCHMARK_FILE="${3:-benchmarks/scenario/IndyDidRegistry/config-createDid.yaml}"
+BROKER_ADDRESS="mqtt://${MANAGER_IP}:1883"
+
+cd "$(dirname "$0")"
+rm -f /home/ubuntu/worker-remote-*.log
+echo "Lançando $NUM_WORKERS workers, conectando em $BROKER_ADDRESS ..."
+for i in $(seq 1 "$NUM_WORKERS"); do
+  npx caliper launch worker \
+    --caliper-workspace ./ \
+    --caliper-benchconfig "$BENCHMARK_FILE" \
+    --caliper-networkconfig networks/besu/networkconfig.json \
+    --caliper-worker-communication-method mqtt \
+    --caliper-worker-communication-address "$BROKER_ADDRESS" \
+    > "/home/ubuntu/worker-remote-${i}.log" 2>&1 &
+done
+echo "Workers lançados. Acompanhe os logs em /home/ubuntu/worker-remote-*.log"
+echo "Aguardando o round terminar (Ctrl+C não interrompe os workers em background)..."
+wait
+EOF
+  chmod +x "$CALIPER_ROOT/launch_workers.sh"
+  check "launch_workers.sh criado em $CALIPER_ROOT"
+
+  log "===== Setup Caliper worker concluído — launch_workers.sh chamado por run_distributed_sweep.py ====="
+  exit 0
+fi
+
 # ============================================================================
 # Passo 10.5 — Instalar e iniciar Prometheus para monitoramento dos nós Besu
 # ============================================================================
@@ -392,10 +453,11 @@ else
   python3 run_test_local.py >> "$LOG_FILE" 2>&1
 
   # ============================================================================
-  # Passo 12/13 — Extrair resultados para CSV e subir pro S3
+  # Passo 12/13 — Extrair resultados para CSV e subir pro Blob Storage
   # ============================================================================
-  CALIPER_ROOT="$CALIPER_ROOT" S3_KEYS_BUCKET="$S3_KEYS_BUCKET" AWS_REGION="$AWS_REGION" LOG_FILE="$LOG_FILE" \
-    bash /tmp/extract_and_upload_results.sh
+  CALIPER_ROOT="$CALIPER_ROOT" AZURE_STORAGE_ACCOUNT="$AZURE_STORAGE_ACCOUNT" \
+    AZURE_STORAGE_CONTAINER="$AZURE_STORAGE_CONTAINER" AZURE_IDENTITY_CLIENT_ID="$AZURE_IDENTITY_CLIENT_ID" \
+    LOG_FILE="$LOG_FILE" bash /tmp/extract_and_upload_results.sh
 fi
 
 log "===== ETAPA 3 CONCLUÍDA COM SUCESSO ====="

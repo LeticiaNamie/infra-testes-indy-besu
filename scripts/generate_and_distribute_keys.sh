@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Roda no Node-1 via remote-exec.
-# Gera chaves para todos os nós, constrói enode URLs com IPs fixos e sobe tudo para S3.
+# Gera chaves para todos os nós, constrói enode URLs com IPs fixos e sobe tudo para o Blob Storage.
 set -euo pipefail
 
 LOG_FILE="/home/ubuntu/besu-setup.log"
@@ -13,10 +13,12 @@ BESU_DIR="besu-24.7.0"
 PERMISSIONED_DIR="$REPO_ROOT/Permissioned-Network"
 
 # Variáveis injetadas via env pelo Terraform (remote-exec inline)
-: "${S3_KEYS_BUCKET:?S3_KEYS_BUCKET não definido}"
-: "${AWS_REGION:?AWS_REGION não definido}"
+: "${AZURE_STORAGE_ACCOUNT:?AZURE_STORAGE_ACCOUNT não definido}"
+: "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER não definido}"
+: "${AZURE_IDENTITY_CLIENT_ID:?AZURE_IDENTITY_CLIENT_ID não definido}"
 : "${NODE_COUNT:?NODE_COUNT não definido}"
 : "${TOTAL_CALIPER_WORKERS:?TOTAL_CALIPER_WORKERS não definido}"
+BLOB_BASE="https://$AZURE_STORAGE_ACCOUNT.blob.core.windows.net/$AZURE_STORAGE_CONTAINER"
 
 # IPs privados fixos — 10.0.1.10 + (index-1), ex: Node-1=10.0.1.10, Node-7=10.0.1.16
 declare -A NODE_IPS
@@ -34,6 +36,9 @@ check() {
 }
 
 log "=== Gerando e distribuindo chaves para a rede Besu distribuída ($NODE_COUNT nós) ==="
+
+azcopy login --identity --identity-client-id="$AZURE_IDENTITY_CLIENT_ID"
+check "Login no azcopy via managed identity"
 
 # Clone do repositório adaptado para distribuição
 if [ -d "$REPO_ROOT" ]; then rm -rf "$REPO_ROOT"; fi
@@ -302,20 +307,20 @@ check "Substituição do --bootnodes em docker-compose.validator.yaml"
 log "Verificando substituição:"
 grep -i "bootnodes" "$VALIDATOR_COMPOSE" | tee -a "$LOG_FILE"
 
-# Upload para S3 — chaves por nó + arquivos compartilhados
-log "Fazendo upload das chaves e configurações para S3..."
+# Upload para o Azure Blob Storage — chaves por nó + arquivos compartilhados
+log "Fazendo upload das chaves e configurações para o Blob Storage..."
 for i in $(seq 1 $NODE_COUNT); do
   NODE_DATA="$PERMISSIONED_DIR/Node-$i/data"
-  aws s3 cp "$NODE_DATA/key"     "s3://$S3_KEYS_BUCKET/node-$i/key"     --region "$AWS_REGION"
-  aws s3 cp "$NODE_DATA/key.pub" "s3://$S3_KEYS_BUCKET/node-$i/key.pub" --region "$AWS_REGION"
-  check "Chaves do Node-$i enviadas para S3"
+  azcopy copy "$NODE_DATA/key"     "$BLOB_BASE/node-$i/key"
+  azcopy copy "$NODE_DATA/key.pub" "$BLOB_BASE/node-$i/key.pub"
+  check "Chaves do Node-$i enviadas para o Blob Storage"
 done
 
-aws s3 cp "$REPO_ROOT/genesis.json"                              "s3://$S3_KEYS_BUCKET/shared/genesis.json"                    --region "$AWS_REGION"
-aws s3 cp "$PERMISSIONED_DIR/Node-1/data/static-nodes.json"      "s3://$S3_KEYS_BUCKET/shared/static-nodes.json"              --region "$AWS_REGION"
-aws s3 cp "$PERMISSIONS_TOML"                                    "s3://$S3_KEYS_BUCKET/shared/permissions_config.toml"         --region "$AWS_REGION"
-aws s3 cp "$VALIDATOR_COMPOSE"                                   "s3://$S3_KEYS_BUCKET/shared/docker-compose.validator.yaml"   --region "$AWS_REGION"
-check "Arquivos compartilhados enviados para S3"
+azcopy copy "$REPO_ROOT/genesis.json"                         "$BLOB_BASE/shared/genesis.json"
+azcopy copy "$PERMISSIONED_DIR/Node-1/data/static-nodes.json" "$BLOB_BASE/shared/static-nodes.json"
+azcopy copy "$PERMISSIONS_TOML"                               "$BLOB_BASE/shared/permissions_config.toml"
+azcopy copy "$VALIDATOR_COMPOSE"                              "$BLOB_BASE/shared/docker-compose.validator.yaml"
+check "Arquivos compartilhados enviados para o Blob Storage"
 
 log "=== Geração e distribuição de chaves concluída com sucesso ==="
 for i in $(seq 1 $NODE_COUNT); do

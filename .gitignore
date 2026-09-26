@@ -1,0 +1,10 @@
+# Cache local de providers/módulos do Terraform (binários, ~1GB) — regenerado por `terraform init`
+.terraform/
+
+# Saída binária de `terraform plan -out=...` — transiente, não é fonte de verdade
+tfplan.out
+*.tfplan
+
+# Bytecode Python
+__pycache__/
+*.pyc

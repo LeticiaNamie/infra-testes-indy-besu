@@ -37,13 +37,13 @@ check "Docker iniciado"
 usermod -aG docker ubuntu
 check "ubuntu adicionado ao grupo docker"
 
-log "Instalando AWS CLI v2"
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-unzip -q /tmp/awscliv2.zip -d /tmp/awscli
-/tmp/awscli/aws/install
-rm -rf /tmp/awscliv2.zip /tmp/awscli
-check "AWS CLI instalado"
+log "Instalando azcopy"
+curl -fsSL "https://aka.ms/downloadazcopy-v10-linux" -o /tmp/azcopy.tar.gz
+tar -xzf /tmp/azcopy.tar.gz -C /tmp
+install -m 0755 /tmp/azcopy_linux_amd64_*/azcopy /usr/local/bin/azcopy
+rm -rf /tmp/azcopy.tar.gz /tmp/azcopy_linux_amd64_*
+check "azcopy instalado"
 
-log "=== Bootstrap do Node-${node_index} concluído — Docker e AWS CLI prontos ==="
+log "=== Bootstrap do Node-${node_index} concluído — Docker e azcopy prontos ==="
 touch /home/ubuntu/.node-ready
 chown ubuntu:ubuntu /home/ubuntu/.node-ready
