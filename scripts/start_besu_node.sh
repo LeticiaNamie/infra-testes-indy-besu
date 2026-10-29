@@ -101,10 +101,11 @@ fi
 
 cd "$REPO_ROOT"
 
-# Node-1: garante que o WS escute em 0.0.0.0 (necessário para o Caliper em EC2 separada)
-# Por padrão o Besu liga o WS em 127.0.0.1 — sem esse flag a porta fica fechada externamente
-if [ "$NODE_INDEX" = "1" ] && ! grep -q "rpc-ws-host" "$COMPOSE_FILE"; then
-  sed -i '/--rpc-ws-port=8645/a\      --rpc-ws-host=0.0.0.0' "$COMPOSE_FILE"
+# Todos os nós: garante que o WS escute em 0.0.0.0 (necessário para o Caliper em VM separada,
+# inclusive quando os envios são distribuídos entre os nós). Por padrão o Besu liga o WS em
+# 127.0.0.1 — sem esse flag a porta fica fechada externamente. Bootnodes usam 8645, validadores 8646.
+if ! grep -q "rpc-ws-host" "$COMPOSE_FILE"; then
+  sed -i '/--rpc-ws-port=86[0-9][0-9]/a\      --rpc-ws-host=0.0.0.0' "$COMPOSE_FILE"
   log "Adicionado --rpc-ws-host=0.0.0.0 ao $COMPOSE_FILE"
 fi
 

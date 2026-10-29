@@ -148,6 +148,7 @@ nem `Fasv6`/`Fasv7` (4GB/vCPU em vez de 2GB/vCPU).
 
 | Variável | Valor padrão | Descrição |
 |---|---|---|
+| `spread_sends` | `false` | `true` = workers do Caliper distribuídos entre os `node_count` nós (worker i → nó i % node_count); `false` = todos enviam só ao Node-1 |
 | `node_count` | `6` | Número total de nós (4–14) |
 | `allowed_ssh_cidr` | — | IP/CIDR autorizado para SSH |
 | `private_key_path` | `~/.ssh/besu-key` | Chave SSH para remote-exec |

@@ -89,6 +89,12 @@ variable "node_caliper_count" {
   }
 }
 
+variable "spread_sends" {
+  type        = bool
+  default     = false
+  description = "false (padrão) = todos os workers do Caliper enviam só para o Node-1. true = os workers são distribuídos entre os node_count nós (worker i usa o nó i % node_count), via networkconfig.json \"urls\"."
+}
+
 variable "caliper_a_workers" {
   type        = number
   default     = 10

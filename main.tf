@@ -667,7 +667,7 @@ resource "null_resource" "run_caliper_tests" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/run_caliper_tests.sh /tmp/extract_and_upload_results.sh",
-      "NODE_COUNT=${var.node_count} AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} NODE1_PRIVATE_IP=10.0.1.10 SKIP_SWEEP=${var.node_caliper_count > 1 ? "true" : "false"} bash /tmp/run_caliper_tests.sh",
+      "NODE_COUNT=${var.node_count} AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} NODE1_PRIVATE_IP=10.0.1.10 SPREAD_SENDS=${var.spread_sends} SKIP_SWEEP=${var.node_caliper_count > 1 ? "true" : "false"} bash /tmp/run_caliper_tests.sh",
     ]
   }
 }
@@ -826,7 +826,7 @@ resource "null_resource" "setup_caliper_b" {
   provisioner "remote-exec" {
     inline = [
       "chmod +x /tmp/run_caliper_tests.sh",
-      "ROLE=worker AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} NODE1_PRIVATE_IP=10.0.1.10 bash /tmp/run_caliper_tests.sh",
+      "ROLE=worker AZURE_STORAGE_ACCOUNT=${azurerm_storage_account.besu_data.name} AZURE_STORAGE_CONTAINER=${azurerm_storage_container.besu_data.name} AZURE_IDENTITY_CLIENT_ID=${azurerm_user_assigned_identity.besu_data.client_id} NODE_COUNT=${var.node_count} SPREAD_SENDS=${var.spread_sends} NODE1_PRIVATE_IP=10.0.1.10 bash /tmp/run_caliper_tests.sh",
     ]
   }
 }

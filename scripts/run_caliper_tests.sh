@@ -26,9 +26,14 @@ fi
 : "${AZURE_STORAGE_CONTAINER:?AZURE_STORAGE_CONTAINER não definido}"
 : "${AZURE_IDENTITY_CLIENT_ID:?AZURE_IDENTITY_CLIENT_ID não definido}"
 : "${NODE1_PRIVATE_IP:?NODE1_PRIVATE_IP não definido}"
+: "${NODE_COUNT:?NODE_COUNT não definido}"
+
+# Se true, os workers do Caliper se distribuem entre os NODE_COUNT nós (worker i → nó
+# i % NODE_COUNT) em vez de todos enviarem só para o Node-1. Default false = comportamento
+# anterior (só Node-1). Vale para manager e workers: todos geram o mesmo networkconfig.json.
+SPREAD_SENDS="${SPREAD_SENDS:-false}"
 
 if [ "$ROLE" = "manager" ]; then
-  : "${NODE_COUNT:?NODE_COUNT não definido}"
   # Se true, pula a varredura automática (run_test_local.py) e a extração/upload de CSVs —
   # usado quando essa instância vai rodar o teste distribuído (modo MQTT) em vez da
   # varredura de sempre. Setup (clone, bind, networkconfig.json, Prometheus) roda igual.
@@ -113,11 +118,31 @@ fi
 # ============================================================================
 # Passo 4 — Instalar Node.js v18 via NodeSource
 # ============================================================================
-if ! command -v node &>/dev/null; then
+# O mirror do Ubuntu na Azure às vezes devolve 502 transitório. Se o setup do
+# NodeSource falhar no meio, o repo dele não é adicionado e o apt instala o nodejs
+# v12 do Ubuntu (sem npm) — por isso tenta de novo e valida a versão no final.
+if ! node --version 2>/dev/null | grep -q '^v18\.'; then
   log "Instalando Node.js v18 via NodeSource..."
-  curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - 2>>"$LOG_FILE"
-  sudo apt-get install -y nodejs
-  check "Node.js v18 instalado"
+  if command -v node &>/dev/null; then
+    log "Removendo Node.js $(node --version) do Ubuntu antes de instalar a v18..."
+    sudo apt-get remove -y nodejs libnode72 || true
+  fi
+  for i in $(seq 1 5); do
+    if curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - 2>>"$LOG_FILE" \
+       && sudo apt-get install -y -o Acquire::Retries=5 nodejs \
+       && node --version 2>/dev/null | grep -q '^v18\.' \
+       && command -v npm &>/dev/null; then
+      break
+    fi
+    log "Tentativa $i/5 de instalar Node.js v18 falhou — tentando de novo em 15s..."
+    sudo apt-get update -y -o Acquire::Retries=5 || true
+    sleep 15
+  done
+  if ! { node --version 2>/dev/null | grep -q '^v18\.' && command -v npm &>/dev/null; }; then
+    log "ERRO: Node.js v18 instalado (node: $(node --version 2>/dev/null || echo ausente), npm: $(command -v npm || echo ausente))"
+    exit 1
+  fi
+  log "OK: Node.js v18 instalado"
 else
   log "Node.js já instalado: $(node --version)"
 fi
@@ -309,6 +334,18 @@ def fix_contracts(obj):
         if name in obj and isinstance(obj[name], dict) and "address" in obj[name]:
             obj[name]["address"] = addr
 walk(config, fix_contracts)
+
+# Distribuição dos envios: lista de WS de todos os nós (IPs 10.0.1.10, .11, ...; bootnodes
+# Node-1/Node-3 usam WS 8645, validadores 8646). Sem SPREAD_SENDS remove "urls" e o conector
+# usa só "url" (Node-1).
+if "$SPREAD_SENDS" == "true":
+    config["ethereum"]["urls"] = [
+        f"ws://10.0.1.{9 + i}:{8645 if i in (1, 3) else 8646}"
+        for i in range(1, $NODE_COUNT + 1)
+    ]
+    print("Envios distribuídos entre", len(config["ethereum"]["urls"]), "nós:", config["ethereum"]["urls"])
+else:
+    config["ethereum"].pop("urls", None)
 
 with open("$NETWORK_CONFIG", "w") as f:
     json.dump(config, f, indent=2)
