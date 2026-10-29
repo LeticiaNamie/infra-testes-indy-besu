@@ -396,7 +396,12 @@ def main():
             print(f"\n{'='*50}\n🚀 Iniciando testes para função: {function_name}\n{'='*50}")
             for tps in cfg.tps_list:
                 run_round(cfg, function_name, benchmark_file, tps, args.max_retries, args.retry_delay, dry_run=args.dry_run)
-                if not args.dry_run:
+                # Após o último round da varredura não há próximo round pra proteger do
+                # backlog do txpool — segue direto pra extração dos CSVs.
+                is_last_round = (repetition == cfg.repetitions
+                                 and function_name == cfg.functions[-1]
+                                 and tps == cfg.tps_list[-1])
+                if not args.dry_run and not is_last_round:
                     time.sleep(10)
                     wait_txpool_drain_remote(cfg, tps, dry_run=args.dry_run)
 
