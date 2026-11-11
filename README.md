@@ -54,7 +54,21 @@ vm_size_caliper    = "Standard_D16s_v7"
 node_caliper_count = 1                     # veja o passo 3
 ```
 
-Outras variáveis (em `variables.tf`): `node_count` (4 a 14, padrão 6), `spread_sends`, `caliper_a_workers` e `caliper_b_workers`.
+Outras variáveis (em `variables.tf`), todas com valor padrão:
+
+| Variável | Padrão | O que controla |
+|---|---|---|
+| `node_count` | `6` | Quantidade de nós Besu (de 4 a 14; o QBFT exige no mínimo 4). Todos são validadores; Node-1 e Node-3 também são bootnodes. |
+| `node_caliper_count` | `1` | Quantidade de VMs Caliper. |
+| `spread_sends` | `false` | `false`: todos os workers enviam ao Node-1. `true`: o worker `i` envia ao nó `i % node_count`, distribuindo as transações entre os nós. |
+| `caliper_a_workers` | `10` | Workers locais na VM A (manager). |
+| `caliper_b_workers` | `10` | Workers em cada VM Caliper extra (usado só com `node_caliper_count > 1`). |
+
+Qualquer uma pode ser definida no `terraform.tfvars` ou na linha de comando, por exemplo:
+
+```bash
+terraform apply -var="node_count=8" -var="node_caliper_count=3" -var="spread_sends=true"
+```
 
 ### 3. Escolher o modo de teste
 
