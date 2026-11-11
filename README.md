@@ -47,6 +47,12 @@ instance_type_caliper = "c6i.xlarge"
 node_count            = 6                      # de 4 a 14 (QBFT exige no mínimo 4)
 ```
 
+`node_count` define a quantidade de nós Besu. Todos são validadores; Node-1 e Node-3 também são bootnodes. Além do `terraform.tfvars`, o valor pode ser passado na linha de comando:
+
+```bash
+terraform apply -var="node_count=8"
+```
+
 Região e zona padrão: `us-east-1` e `us-east-1a` (`aws_region` e `aws_az` em `variables.tf`).
 
 ### 3. Subir
