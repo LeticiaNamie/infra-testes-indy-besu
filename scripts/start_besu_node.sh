@@ -40,7 +40,7 @@ log "=== Iniciando Node-$NODE_INDEX com $COMPOSE_FILE ==="
 # (Node-1 já tem o repo clonado de generate_and_distribute_keys.sh)
 if [ "$NODE_INDEX" != "1" ]; then
   if [ -d "$REPO_ROOT" ]; then rm -rf "$REPO_ROOT"; fi
-  git clone https://github.com/LeticiaNamie/besu-production-docker-distributed.git "$REPO_ROOT"
+  git clone https://github.com/LeticiaNamie/besu-docker-distributed.git "$REPO_ROOT"
   check "Clone do repositório"
 
   cd "$REPO_ROOT"

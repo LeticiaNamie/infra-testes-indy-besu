@@ -105,7 +105,7 @@ log "node: $(node --version)  npm: $(npm --version)"
 if [ -d "$CLONE_ROOT" ]; then
   rm -rf "$CLONE_ROOT"
 fi
-git clone https://github.com/LeticiaNamie/tests-with-caliper.git "$CLONE_ROOT"
+git clone https://github.com/LeticiaNamie/tests-with-caliper-production.git "$CLONE_ROOT"
 check "Clone do repositório tests-with-caliper"
 
 [ -f "$CALIPER_ROOT/run_test_local.py" ] || {

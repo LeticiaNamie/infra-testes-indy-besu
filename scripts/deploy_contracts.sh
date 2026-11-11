@@ -59,7 +59,7 @@ log "node: $(node --version)  npm: $(npm --version)"
 if [ -d "$CONTRACTS_ROOT" ]; then
   rm -rf "$CONTRACTS_ROOT"
 fi
-git clone https://github.com/jeffsonsousa/contracts-indy-besu.git "$CONTRACTS_ROOT"
+git clone https://github.com/LeticiaNamie/smart-contracts-indy-besu.git "$CONTRACTS_ROOT"
 check "Clone do repositório contracts-indy-besu"
 
 # ============================================================================
