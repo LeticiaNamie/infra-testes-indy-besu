@@ -42,7 +42,7 @@ log "=== Iniciando Node-$NODE_INDEX com $COMPOSE_FILE ==="
 # (Node-1 já tem o repo clonado de generate_and_distribute_keys.sh)
 if [ "$NODE_INDEX" != "1" ]; then
   if [ -d "$REPO_ROOT" ]; then rm -rf "$REPO_ROOT"; fi
-  git clone https://github.com/LeticiaNamie/besu-production-docker-distributed.git "$REPO_ROOT"
+  git clone https://github.com/LeticiaNamie/besu-docker-distributed.git "$REPO_ROOT"
   check "Clone do repositório"
 
   cd "$REPO_ROOT"
@@ -159,7 +159,7 @@ log "Heap da JVM ajustado para -Xmx$BESU_XMX (RAM detectada: ${RAM_GB}GB, Node-$
 # correção caso a causa real seja uma pausa de GC/stall de I/O que impeça a
 # thread de rodar de todo — por isso o log de GC acima, pra diferenciar.
 if [ "$NODE_INDEX" = "1" ]; then
-  sed -i "/--tx-pool-max-future-by-sender=5000/a\\      --poa-block-txs-selection-max-time=4000" "$COMPOSE_FILE"
+  sed -i "/--min-gas-price=0/a\\      --poa-block-txs-selection-max-time=4000" "$COMPOSE_FILE"
   log "poa-block-txs-selection-max-time ajustado para 4000ms no Node-1 (default calculado ~750ms insuficiente sob carga alta)"
 fi
 

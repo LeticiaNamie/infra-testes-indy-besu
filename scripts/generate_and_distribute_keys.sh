@@ -42,8 +42,8 @@ check "Login no azcopy via managed identity"
 
 # Clone do repositório adaptado para distribuição
 if [ -d "$REPO_ROOT" ]; then rm -rf "$REPO_ROOT"; fi
-git clone https://github.com/LeticiaNamie/besu-production-docker-distributed.git "$REPO_ROOT"
-check "Clone do repositório LeticiaNamie/besu-production-docker-distributed"
+git clone https://github.com/LeticiaNamie/besu-docker-distributed.git "$REPO_ROOT"
+check "Clone do repositório LeticiaNamie/besu-docker-distributed"
 
 cd "$REPO_ROOT"
 
